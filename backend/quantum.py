@@ -239,6 +239,32 @@ def run_trace(
     }
 
 
+def sample_continuation(
+    state: np.ndarray,
+    qubits: int,
+    steps: list[dict[str, Any]],
+    rng: np.random.Generator,
+) -> dict[str, Any]:
+    """Sample one continuation from an already-collapsed prefix state."""
+    state = state.copy()
+    measurements: list[dict[str, Any]] = []
+    for index, step in enumerate(steps):
+        if step["type"] == MEASURE_GATE:
+            target = int(step["target"])
+            state, outcome = measure(state, qubits, target, rng)
+            measurements.append(
+                {"step": index, "target": target, "outcome": outcome}
+            )
+        else:
+            state = apply_gate(state, qubits, step)
+    probs = probabilities(state)
+    final_index = int(rng.choice(len(probs), p=probs))
+    return {
+        "sample": format(final_index, f"0{qubits}b"),
+        "measurements": measurements,
+    }
+
+
 def ideal_probabilities(
     qubits: int, basis: str, steps: list[dict[str, Any]]
 ) -> dict[str, float]:

@@ -1,5 +1,7 @@
 import type {
   BranchComparison,
+  BranchExperiment,
+  BranchExperimentSpec,
   CheckpointState,
   CircuitStep,
   Circuit,
@@ -51,6 +53,42 @@ export function compareBranches(
     branch_a: { label: branchA.label, steps: stripIds(branchA.steps) },
     branch_b: { label: branchB.label, steps: stripIds(branchB.steps) },
   });
+}
+
+export function createBranchExperiment(
+  checkpointId: string,
+  branches: BranchExperimentSpec[],
+  options: { seed?: number | null; storageDir?: string } = {},
+) {
+  return request<BranchExperiment>(`/api/checkpoints/${checkpointId}/branch-experiments`, "POST", {
+    name: "conditional-branches",
+    seed: options.seed ?? null,
+    storage_dir: options.storageDir || undefined,
+    branches: branches.map((branch) => ({
+      branch_id: branch.branch_id,
+      label: branch.label,
+      budget: branch.budget,
+      steps: stripIds(branch.steps),
+    })),
+  });
+}
+
+export function addBranchShots(
+  experimentId: string,
+  branchId: string,
+  shots: number,
+  source = "ui-continued",
+  storageDir?: string,
+) {
+  return request<BranchExperiment>(
+    `/api/branch-experiments/${encodeURIComponent(experimentId)}/branches/${encodeURIComponent(branchId)}/shots`,
+    "PATCH",
+    { shots, source, storage_dir: storageDir },
+  );
+}
+
+export function getBranchExperiment(experimentId: string) {
+  return request<BranchExperiment>(`/api/branch-experiments/${encodeURIComponent(experimentId)}`, "GET");
 }
 
 function stripIds(steps: CircuitStep[]) {

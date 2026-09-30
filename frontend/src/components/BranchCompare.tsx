@@ -1,67 +1,169 @@
 import { useState } from "react";
-import { Trash2 } from "lucide-react";
-import { compareBranches } from "../api";
+import { Plus, Trash2 } from "lucide-react";
+import { addBranchShots, createBranchExperiment, getBranchExperiment } from "../api";
 import { newStepId } from "../store";
-import type { BranchComparison, CheckpointState, CircuitStep, GateType } from "../types";
+import type { BranchExperiment, CheckpointState, CircuitStep, GateType } from "../types";
 
 interface Props {
   checkpoints: CheckpointState[];
   disabled: boolean;
 }
 
-const BRANCH_GATES: GateType[] = ["H", "X", "Y", "Z", "CNOT", "MEASURE"];
+interface BranchDraft {
+  id: string;
+  label: string;
+  budget: number;
+  nextShots: number;
+  steps: CircuitStep[];
+}
 
-function emptyBranch() {
-  return [{ id: newStepId(), type: "H" as GateType, target: 0 }];
+const BRANCH_GATES: GateType[] = ["H", "X", "Y", "Z", "CNOT", "CZ", "MEASURE"];
+
+function makeGate(qubits: number, type: GateType = "H"): CircuitStep {
+  const step: CircuitStep = { id: newStepId(), type };
+  if (type === "CNOT" || type === "CZ") {
+    step.control = 0;
+    step.target = Math.min(1, qubits - 1);
+  } else {
+    step.target = 0;
+  }
+  return step;
+}
+
+function defaultBranches(qubits: number): BranchDraft[] {
+  return [
+    {
+      id: "branch-1",
+      label: "条件操作 A",
+      budget: 256,
+      nextShots: 256,
+      steps: [{ id: newStepId(), type: "X", target: Math.min(1, qubits - 1) }],
+    },
+    { id: "branch-2", label: "条件操作 B", budget: 256, nextShots: 256, steps: [] },
+  ];
 }
 
 export function BranchCompare({ checkpoints, disabled }: Props) {
   const [checkpointId, setCheckpointId] = useState("");
-  const [branchA, setBranchA] = useState<CircuitStep[]>([{ id: newStepId(), type: "X", target: 1 }]);
-  const [branchB, setBranchB] = useState<CircuitStep[]>(emptyBranch);
-  const [loading, setLoading] = useState(false);
+  const [branches, setBranches] = useState<BranchDraft[]>(() => defaultBranches(1));
+  const [loadingId, setLoadingId] = useState("");
   const [error, setError] = useState("");
-  const [result, setResult] = useState<BranchComparison | null>(null);
+  const [result, setResult] = useState<BranchExperiment | null>(null);
+  const [restoreId, setRestoreId] = useState("");
 
   const checkpoint = checkpoints.find((item) => item.checkpoint_id === checkpointId) ?? null;
-  const qubits = checkpoint?.qubits ?? 1;
+  const busy = disabled || loadingId !== "";
 
-  function addStep(branch: "A" | "B") {
-    const step = { id: newStepId(), type: "H" as GateType, target: 0 };
-    if (branch === "A") setBranchA((prev) => [...prev, step]);
-    else setBranchB((prev) => [...prev, step]);
+  function updateBranch(id: string, patch: Partial<BranchDraft>) {
+    setBranches((prev) => prev.map((branch) => (branch.id === id ? { ...branch, ...patch } : branch)));
   }
 
-  function removeStep(branch: "A" | "B", id: string) {
-    if (branch === "A") setBranchA((prev) => prev.filter((step) => step.id !== id));
-    else setBranchB((prev) => prev.filter((step) => step.id !== id));
+  function updateStep(branchId: string, stepId: string, patch: Partial<CircuitStep>) {
+    setBranches((prev) =>
+      prev.map((branch) =>
+        branch.id === branchId
+          ? { ...branch, steps: branch.steps.map((step) => (step.id === stepId ? { ...step, ...patch } : step)) }
+          : branch,
+      ),
+    );
   }
 
-  async function runCompare() {
-    if (!checkpoint || loading) return;
-    setLoading(true);
+  function selectCheckpoint(id: string) {
+    setCheckpointId(id);
+    setResult(null);
+    setError("");
+  }
+
+  async function runExperiment() {
+    if (!checkpoint || busy) return;
+    if (branches.length === 0 || branches.some((branch) => !branch.label.trim() || branch.budget < 0)) {
+      setError("请为每个分支填写唯一名称，并将初始样本数设为非负整数。");
+      return;
+    }
+    setLoadingId("create");
     setError("");
     try {
-      setResult(await compareBranches(checkpointId, { label: "分支 A", steps: branchA }, { label: "分支 B", steps: branchB }));
+      setResult(
+        await createBranchExperiment(
+          checkpointId,
+          branches.map((branch) => ({
+            branch_id: branch.id,
+            label: branch.label.trim(),
+            budget: branch.budget,
+            steps: branch.steps,
+          })),
+          { seed: checkpoint.seed },
+        ),
+      );
     } catch (err) {
       const payload = err as { errors?: Array<{ message: string }>; error?: string };
-      setError(payload.errors?.map((item) => item.message).join("; ") ?? payload.error ?? "比较失败");
+      setError(payload.errors?.map((item) => item.message).join("; ") ?? payload.error ?? "分支实验失败");
     } finally {
-      setLoading(false);
+      setLoadingId("");
+    }
+  }
+
+  async function continueBranch(branchId: string, shots: number) {
+    if (!result || busy) return;
+    if (!Number.isInteger(shots) || shots <= 0) {
+      setError("追加样本数必须是正整数。");
+      return;
+    }
+    setLoadingId(branchId);
+    setError("");
+    try {
+      setResult(await addBranchShots(result.experiment_id, branchId, shots));
+    } catch (err) {
+      const payload = err as { error?: string };
+      setError(payload.error ?? "追加样本失败");
+    } finally {
+      setLoadingId("");
+    }
+  }
+
+  async function restoreExperiment() {
+    const id = restoreId.trim();
+    if (!id || busy) return;
+    setLoadingId("restore");
+    setError("");
+    try {
+      const restored = await getBranchExperiment(id);
+      setResult(restored);
+      setCheckpointId(restored.common_prefix.checkpoint_id);
+      setBranches(
+        restored.branches.map((branch) => ({
+          id: branch.branch_id,
+          label: branch.label,
+          budget: branch.budget,
+          nextShots: 256,
+          steps: branch.condition_steps.map((step) => ({ ...(step as CircuitStep), id: newStepId() })),
+        })),
+      );
+    } catch (err) {
+      const payload = err as { error?: string };
+      setError(payload.error ?? "恢复分支实验失败");
+    } finally {
+      setLoadingId("");
     }
   }
 
   return (
     <section className="panel">
-      <h2>保存点后续分支比较</h2>
+      <h2>中途测量后的条件分支实验</h2>
       <p className="muted">
-        选择一个保存点，为两个分支各自添加后续步骤；比较时两个分支都从同一坍缩状态与随机数位置出发，保存前已发生的测量不会重新抽取。
+        各分支共享保存点之前的状态、测量事实和前缀说明；后续条件、随机流、计数与批次互相独立，统计结果不会跨条件合并。
       </p>
-      <select value={checkpointId} onChange={(event) => { setCheckpointId(event.target.value); setResult(null); }}>
-        <option value="">选择保存点…</option>
+      <div className="inline-controls">
+        <input value={restoreId} onChange={(event) => setRestoreId(event.target.value)} placeholder="按实验 ID 恢复已保存结果…" />
+        <button type="button" onClick={restoreExperiment} disabled={busy || !restoreId.trim()}>
+          {loadingId === "restore" ? "恢复中…" : "恢复实验"}
+        </button>
+      </div>
+      <select value={checkpointId} onChange={(event) => selectCheckpoint(event.target.value)}>
+        <option value="">选择中途保存点…</option>
         {checkpoints.map((item) => (
           <option key={item.checkpoint_id} value={item.checkpoint_id}>
-            {item.name}（第 {item.next_index}/{item.total_steps} 步）
+            {item.name}（共同前缀第 {item.next_index}/{item.total_steps} 步）
           </option>
         ))}
       </select>
@@ -69,41 +171,44 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
       {checkpoint && (
         <>
           <div className="branch-grid">
-            <BranchEditor label="分支 A" steps={branchA} qubits={qubits} onAdd={() => addStep("A")} onRemove={(id) => removeStep("A", id)} onChange={setBranchA} />
-            <BranchEditor label="分支 B" steps={branchB} qubits={qubits} onAdd={() => addStep("B")} onRemove={(id) => removeStep("B", id)} onChange={setBranchB} />
+            {branches.map((branch, index) => (
+              <BranchEditor
+                key={branch.id}
+                branch={branch}
+                index={index}
+                qubits={checkpoint.qubits}
+                canRemove={branches.length > 1}
+                onUpdate={(patch) => updateBranch(branch.id, patch)}
+                onRemove={() => setBranches((prev) => prev.filter((item) => item.id !== branch.id))}
+                onStep={updateStep}
+              />
+            ))}
           </div>
           <div className="inline-controls">
-            <button type="button" className="primary" onClick={runCompare} disabled={disabled || loading}>
-              {loading ? "比较中…" : "比较两个后续分支"}
+            <button
+              type="button"
+              onClick={() =>
+                setBranches((prev) => [
+                  ...prev,
+                  {
+                    id: `branch-${Date.now()}`,
+                    label: `条件操作 ${String.fromCharCode(65 + prev.length)}`,
+                    budget: 256,
+                    nextShots: 256,
+                    steps: [makeGate(checkpoint.qubits)],
+                  },
+                ])
+              }
+              disabled={busy || branches.length >= 8}
+            >
+              <Plus size={14} /> 添加方案
             </button>
-            <span className="muted">可添加的门：{BRANCH_GATES.join(" / ")}</span>
+            <button type="button" className="primary" onClick={runExperiment} disabled={busy}>
+              {loadingId === "create" ? "运行中…" : "运行独立分支样本"}
+            </button>
           </div>
           {error && <div className="error-box">{error}</div>}
-          {result && (
-            <div className="branch-results">
-              {result.branches.map((branch) => (
-                <div key={branch.label} className="branch-result">
-                  <strong>{branch.label}</strong>
-                  <ul className="muted">
-                    {branch.steps.map((step) => (
-                      <li key={step.index}>
-                        {step.type}
-                        {step.measured ? ` → q${step.measured.target}=${step.measured.outcome}` : ""}
-                      </li>
-                    ))}
-                    {branch.steps.length === 0 && <li>（无后续步骤）</li>}
-                  </ul>
-                  <div className="prob-compact">
-                    {Object.entries(branch.final_probabilities).map(([label, value]) => (
-                      <span key={label} className={value > 0 ? "prob-hot" : ""}>
-                        |{label}⟩ {value.toFixed(3)}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+          {result && <ExperimentResult result={result} branches={branches} busy={busy} loadingId={loadingId} onContinue={continueBranch} />}
         </>
       )}
     </section>
@@ -111,69 +216,121 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
 }
 
 interface EditorProps {
-  label: string;
-  steps: CircuitStep[];
+  branch: BranchDraft;
+  index: number;
   qubits: number;
-  onAdd: () => void;
-  onRemove: (id: string) => void;
-  onChange: (steps: CircuitStep[]) => void;
+  canRemove: boolean;
+  onUpdate: (patch: Partial<BranchDraft>) => void;
+  onRemove: () => void;
+  onStep: (branchId: string, stepId: string, patch: Partial<CircuitStep>) => void;
 }
 
-function BranchEditor({ label, steps, qubits, onAdd, onRemove, onChange }: EditorProps) {
+function BranchEditor({ branch, qubits, canRemove, onUpdate, onRemove, onStep }: EditorProps) {
   const options = Array.from({ length: qubits }, (_, q) => q);
   return (
     <div className="branch-editor">
       <div className="branch-head">
-        <strong>{label}</strong>
-        <button type="button" onClick={onAdd}>+ 步骤</button>
+        <input value={branch.label} onChange={(event) => onUpdate({ label: event.target.value })} />
+        <button type="button" aria-label="删除分支" onClick={onRemove} disabled={!canRemove}>
+          <Trash2 size={13} />
+        </button>
       </div>
-      {steps.map((step, index) => (
+      <label className="field">
+        初始样本预算
+        <input type="number" min={0} max={100000} value={branch.budget} onChange={(event) => onUpdate({ budget: Number(event.target.value) })} />
+      </label>
+      {branch.steps.map((step, stepIndex) => (
         <div key={step.id} className="branch-step">
-          <span className="step-index">#{index + 1}</span>
-          <select
-            value={step.type}
-            onChange={(event) =>
-              onChange(steps.map((item) => (item.id === step.id ? { ...item, type: event.target.value as GateType } : item)))
-            }
-          >
-            {BRANCH_GATES.map((gate) => (
-              <option key={gate} value={gate}>{gate}</option>
-            ))}
+          <span className="step-index">#{stepIndex + 1}</span>
+          <select value={step.type} onChange={(event) => onStep(branch.id, step.id, { type: event.target.value as GateType, control: undefined, target: 0 })}>
+            {BRANCH_GATES.map((gate) => <option key={gate} value={gate}>{gate}</option>)}
           </select>
-          {step.type === "CNOT" ? (
+          {step.type === "CNOT" || step.type === "CZ" ? (
             <>
-              <select
-                value={step.control ?? 0}
-                onChange={(event) =>
-                  onChange(steps.map((item) => (item.id === step.id ? { ...item, control: Number(event.target.value) } : item)))
-                }
-              >
+              <select value={step.control ?? 0} onChange={(event) => onStep(branch.id, step.id, { control: Number(event.target.value) })}>
                 {options.map((q) => <option key={q} value={q}>c q{q}</option>)}
               </select>
-              <select
-                value={step.target ?? 0}
-                onChange={(event) =>
-                  onChange(steps.map((item) => (item.id === step.id ? { ...item, target: Number(event.target.value) } : item)))
-                }
-              >
+              <select value={step.target ?? 0} onChange={(event) => onStep(branch.id, step.id, { target: Number(event.target.value) })}>
                 {options.map((q) => <option key={q} value={q}>t q{q}</option>)}
               </select>
             </>
           ) : (
-            <select
-              value={step.target ?? 0}
-              onChange={(event) =>
-                onChange(steps.map((item) => (item.id === step.id ? { ...item, target: Number(event.target.value) } : item)))
-              }
-            >
+            <select value={step.target ?? 0} onChange={(event) => onStep(branch.id, step.id, { target: Number(event.target.value) })}>
               {options.map((q) => <option key={q} value={q}>q{q}</option>)}
             </select>
           )}
-          <button type="button" aria-label="删除" onClick={() => onRemove(step.id)}>
-            <Trash2 size={13} />
+          <button type="button" aria-label="删除步骤" onClick={() => onUpdate({ steps: branch.steps.filter((item) => item.id !== step.id) })}>
+            <Trash2 size={12} />
           </button>
         </div>
       ))}
+      <button type="button" onClick={() => onUpdate({ steps: [...branch.steps, makeGate(qubits)] })}>+ 条件步骤</button>
+    </div>
+  );
+}
+
+function ExperimentResult({
+  result,
+  branches,
+  busy,
+  loadingId,
+  onContinue,
+}: {
+  result: BranchExperiment;
+  branches: BranchDraft[];
+  busy: boolean;
+  loadingId: string;
+  onContinue: (branchId: string, shots: number) => void;
+}) {
+  return (
+    <div className="branch-results">
+      <div className="notice-box">实验 {result.experiment_id.slice(0, 8)} 已保存到：{result.storage_path}</div>
+      <ul className="muted">
+        <li>共同前缀：保存点 {result.common_prefix.checkpoint_id.slice(0, 8)}，已执行 {result.common_prefix.prefix_next_index} 步。</li>
+        <li>前缀测量：{result.common_prefix.prefix_measurements.map((item) => `q${item.target}=${item.outcome}`).join("，") || "无"}</li>
+        <li>基础种子：{result.base_seed}；各分支由基础种子和分支 ID 派生独立随机流。</li>
+      </ul>
+      {result.branches.map((branch) => {
+        const draft = branches.find((item) => item.id === branch.branch_id);
+        return (
+          <div key={branch.branch_id} className="branch-result">
+            <strong>{branch.label}</strong>
+            <p className="muted">样本来源：{branch.batches.map((batch) => `${batch.source}(${batch.shots})`).join(" + ")}；共 {branch.completed_shots} 个独立样本。</p>
+            <div className="prob-compact">
+              {Object.entries(branch.frequencies).map(([label, value]) => (
+                <span key={label} className={value > 0 ? "prob-hot" : ""}>
+                  |{label}⟩ {branch.counts[label]}（{(value * 100).toFixed(1)}%）
+                </span>
+              ))}
+            </div>
+            <ContinueShots branchId={branch.branch_id} defaultValue={draft?.nextShots ?? 256} busy={busy} loading={loadingId} onContinue={onContinue} />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ContinueShots({
+  branchId,
+  defaultValue,
+  busy,
+  loading,
+  onContinue,
+}: {
+  branchId: string;
+  defaultValue: number;
+  busy: boolean;
+  loading: string;
+  onContinue: (branchId: string, shots: number) => void;
+}) {
+  const [shots, setShots] = useState(defaultValue);
+  return (
+    <div className="inline-controls">
+      <input type="number" min={1} max={100000} value={shots} onChange={(event) => setShots(Number(event.target.value))} />
+      <button type="button" onClick={() => onContinue(branchId, shots)} disabled={busy}>
+        {loading === branchId ? "追加中…" : "仅追加此分支"}
+      </button>
     </div>
   );
 }

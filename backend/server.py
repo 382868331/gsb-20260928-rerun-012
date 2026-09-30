@@ -10,6 +10,7 @@ import json
 import threading
 import time
 import uuid
+from urllib.parse import parse_qs, urlparse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,12 +18,14 @@ from typing import Any
 
 import numpy as np
 
+from . import branches as branch_store
 from . import quantum
 
 HOST = "127.0.0.1"
 PORT = 8000
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CIRCUITS_FILE = DATA_DIR / "circuits.json"
+BRANCH_DIR = DATA_DIR / "branch-experiments"
 
 
 def _load_circuits() -> dict[str, Any]:
@@ -266,6 +269,53 @@ def run_continuation(
     }
 
 
+def _branch_specs_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if isinstance(payload.get("branches"), list):
+        specs = payload["branches"]
+    else:
+        specs = [payload.get("branch_a"), payload.get("branch_b")]
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(specs):
+        if not isinstance(raw, dict) or not isinstance(raw.get("steps"), list):
+            raise ValueError(f"branches[{index}] must be an object with a steps list")
+        normalized.append(
+            {
+                "branch_id": str(raw.get("branch_id") or f"branch-{index + 1}"),
+                "label": raw.get("label") or f"分支 {index + 1}",
+                "steps": raw["steps"],
+                "budget": raw.get("budget", int(payload.get("shots", 0))),
+            }
+        )
+    if not 1 <= len(normalized) <= 8:
+        raise ValueError("branches must contain between 1 and 8 entries")
+    return normalized
+
+
+def _branch_storage_dir(payload: dict[str, Any]) -> Path:
+    raw = payload.get("storage_dir")
+    if raw is None:
+        return BRANCH_DIR
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("storage_dir must be a non-empty path string")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ValueError("storage_dir must be an absolute path")
+    return path
+
+
+def _load_branch_experiment(experiment_id: str, storage_dir: str | Path | None = None) -> branch_store.BranchExperiment:
+    if storage_dir is not None:
+        return branch_store.BranchExperiment.load(Path(storage_dir) / f"{experiment_id}.json")
+    with SESSIONS_LOCK:
+        cached = BRANCH_EXPERIMENTS.get(experiment_id)
+    if cached is not None:
+        return cached
+    return branch_store.BranchExperiment.load(BRANCH_DIR / f"{experiment_id}.json")
+
+
+BRANCH_EXPERIMENTS: dict[str, branch_store.BranchExperiment] = {}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "QuantumBench/0.1"
 
@@ -297,22 +347,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
-            path = self.path.rstrip("/") or "/"
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
             if path == "/api/health":
                 self._send_json(HTTPStatus.OK, {"ok": True, "max_qubits": quantum.MAX_QUBITS})
                 return
             if path == "/api/circuits":
                 with STORAGE_LOCK:
                     self._send_json(HTTPStatus.OK, _load_circuits())
-                return
-            if path.startswith("/api/circuits/"):
-                name = path.rsplit("/", 1)[1]
-                with STORAGE_LOCK:
-                    circuit = _load_circuits()["circuits"].get(name)
-                if circuit is None:
-                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "circuit not found"})
-                else:
-                    self._send_json(HTTPStatus.OK, circuit)
                 return
             if path.startswith("/api/checkpoints/"):
                 checkpoint_id = path.rsplit("/", 1)[1]
@@ -322,6 +364,41 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "checkpoint not found"})
                 else:
                     self._send_json(HTTPStatus.OK, checkpoint.snapshot())
+                return
+
+            if path.startswith("/api/branch-experiments/"):
+                parts = path.strip("/").split("/")
+                if len(parts) == 3:
+                    experiment_id = parts[2]
+                    raw_location = parse_qs(parsed.query).get("storage_dir", [""])[0]
+                    storage_dir = Path(raw_location).expanduser() if raw_location else None
+                    if storage_dir is not None and not storage_dir.is_absolute():
+                        raise ValueError("storage_dir must be an absolute path")
+                else:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                    return
+                if not experiment_id.replace("-", "").isalnum():
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid experiment id"})
+                    return
+                try:
+                    experiment = _load_branch_experiment(experiment_id, storage_dir)
+                except ValueError:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "storage_dir must be an absolute path"})
+                    return
+                except (OSError, KeyError, json.JSONDecodeError):
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "branch experiment not found"})
+                    return
+                self._send_json(HTTPStatus.OK, experiment.snapshot())
+                return
+
+            if path.startswith("/api/circuits/"):
+                name = path.rsplit("/", 1)[1]
+                with STORAGE_LOCK:
+                    circuit = _load_circuits()["circuits"].get(name)
+                if circuit is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "circuit not found"})
+                else:
+                    self._send_json(HTTPStatus.OK, circuit)
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         except Exception as exc:  # never leak a bare HTML 500 to the UI
@@ -471,6 +548,46 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.OK, comparison)
                 return
 
+            if path.startswith("/api/checkpoints/") and path.endswith("/branch-experiments"):
+                parts = path.split("/")
+                checkpoint_id = parts[3] if len(parts) == 5 else ""
+                with SESSIONS_LOCK:
+                    checkpoint = CHECKPOINTS.get(checkpoint_id)
+                if checkpoint is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "checkpoint not found"})
+                    return
+                try:
+                    specs = _branch_specs_from_payload(payload)
+                    storage_dir = _branch_storage_dir(payload)
+                    seed = payload.get("seed")
+                    if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+                        raise ValueError("seed must be an integer or null")
+                    name = payload.get("name", "conditional-branches")
+                    if not isinstance(name, str) or not name.strip():
+                        raise ValueError("name must be a non-empty string")
+                    for spec in specs:
+                        if not 0 <= int(spec["budget"]) <= 100_000:
+                            raise ValueError("each branch budget must be in [0, 100000]")
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                try:
+                    experiment = branch_store.BranchExperiment.create(
+                        checkpoint,
+                        specs,
+                        storage_dir=storage_dir,
+                        base_seed=seed,
+                        name=name.strip(),
+                    )
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                if storage_dir == BRANCH_DIR:
+                    with SESSIONS_LOCK:
+                        BRANCH_EXPERIMENTS[experiment.experiment_id] = experiment
+                self._send_json(HTTPStatus.CREATED, experiment.snapshot())
+                return
+
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         except Exception as exc:  # never leak a bare HTML 500 to the UI
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"server error: {exc}"})
@@ -543,7 +660,48 @@ class Handler(BaseHTTPRequestHandler):
             }
             data["circuits"][name] = record
             _save_circuits(data)
-        self._send_json(HTTPStatus.OK, record)
+            self._send_json(HTTPStatus.OK, record)
+
+    def do_PATCH(self) -> None:
+        try:
+            payload = self._read_json()
+            if payload is None:
+                return
+            parts = self.path.strip("/").split("/")
+            expected = ["api", "branch-experiments", None, "branches", None, "shots"]
+            if len(parts) != len(expected) or any(value is not None and item != value for item, value in zip(parts, expected)):
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+            experiment_id, branch_id = parts[2], parts[4]
+            shots = payload.get("shots")
+            if not isinstance(shots, int) or isinstance(shots, bool) or not 1 <= shots <= 100_000:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "shots must be an integer in [1, 100000]"})
+                return
+            source = payload.get("source", "continued")
+            if not isinstance(source, str) or not source.strip():
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "source must be a non-empty string"})
+                return
+            try:
+                storage_dir = _branch_storage_dir(payload)
+                experiment = _load_branch_experiment(experiment_id, storage_dir)
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except (OSError, KeyError, json.JSONDecodeError):
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "branch experiment not found"})
+                return
+            try:
+                with SESSIONS_LOCK:
+                    batch = experiment.add_shots(branch_id, shots, source=source.strip())
+            except KeyError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, {"batch": batch, **experiment.snapshot()})
+        except Exception as exc:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"server error: {exc}"})
 
 
 def main() -> None:
