@@ -24,7 +24,8 @@ SINGLE_GATES = {"H", "X", "Y", "Z", "S", "T"}
 PARAM_GATES = {"RX", "RY", "RZ"}
 TWO_QUBIT_GATES = {"CNOT", "CZ", "SWAP"}
 MEASURE_GATE = "MEASURE"
-ALL_GATES = SINGLE_GATES | PARAM_GATES | TWO_QUBIT_GATES | {MEASURE_GATE}
+CONDITIONAL_GATE = "IF"
+ALL_GATES = SINGLE_GATES | PARAM_GATES | TWO_QUBIT_GATES | {MEASURE_GATE, CONDITIONAL_GATE}
 
 
 def _matrices() -> dict[str, np.ndarray]:
@@ -143,6 +144,18 @@ def measure(state: np.ndarray, qubits: int, target: int, rng: np.random.Generato
     return collapsed, outcome
 
 
+def condition_satisfied(step: dict[str, Any], outcomes: dict[str, int]) -> bool | None:
+    """Evaluate a conditional gate against already observed measurement outcomes.
+
+    Returns None when the control qubit was never measured before this step,
+    which is an invalid circuit rather than a deterministic skip/fire.
+    """
+    control = int(step["control"])
+    if control not in outcomes:
+        return None
+    return outcomes[control] == int(step.get("equals", 1))
+
+
 def validate_circuit(payload: dict[str, Any]) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     qubits = payload.get("qubits")
@@ -181,9 +194,45 @@ def validate_circuit(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 return None
             return value
 
+        if gate == CONDITIONAL_GATE:
+            inner = raw.get("then")
+            control = check_qubit("control")
+            equals = raw.get("equals", 1)
+            if not isinstance(equals, int) or isinstance(equals, bool) or equals not in (0, 1):
+                errors.append({"step": index, "message": "IF needs equals to be 0 or 1"})
+            if not isinstance(inner, dict):
+                errors.append({"step": index, "message": "IF needs a nested gate object in 'then'"})
+                continue
+            if inner.get("type") == CONDITIONAL_GATE:
+                errors.append({"step": index, "message": "IF cannot nest another IF gate"})
+                continue
+            inner_errors = validate_circuit(
+                {"qubits": qubits, "initial_basis": "0" * qubits, "steps": [inner]}
+            )
+            for inner_error in inner_errors:
+                errors.append(
+                    {
+                        "step": index,
+                        "message": f"IF inner gate: {inner_error['message']}",
+                    }
+                )
+            measured_targets = {
+                int(prior.get("target"))
+                for prior in steps[:index]
+                if isinstance(prior, dict) and prior.get("type") == MEASURE_GATE
+            }
+            if control is not None and control not in measured_targets:
+                errors.append(
+                    {
+                        "step": index,
+                        "message": "IF control qubit must be measured by an earlier MEASURE step",
+                    }
+                )
+            continue
+
         if gate in SINGLE_GATES or gate in PARAM_GATES or gate == MEASURE_GATE:
             check_qubit("target")
-        if gate in TWO_QUBIT_GATES:
+        elif gate in TWO_QUBIT_GATES:
             if gate in ("CNOT", "CZ"):
                 first, second = check_qubit("control"), check_qubit("target")
             else:
@@ -197,6 +246,18 @@ def validate_circuit(payload: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(angle, (int, float)) or isinstance(angle, bool) or not math.isfinite(angle):
                 errors.append({"step": index, "message": f"{gate} needs a finite numeric angle (radians)"})
     return errors
+
+
+def resolve_step(step: dict[str, Any], outcomes: dict[str, int]) -> tuple[dict[str, Any], bool, bool]:
+    """Unwrap a conditional step.
+
+    Returns (effective_step, fired, is_conditional). An unsatisfied conditional
+    yields an empty effective step that the executor skips.
+    """
+    if step.get("type") != CONDITIONAL_GATE:
+        return step, True, False
+    fired = condition_satisfied(step, outcomes) is True
+    return (step["then"] if fired else {}), fired, True
 
 
 def _basis_labels(qubits: int) -> list[str]:
@@ -216,19 +277,24 @@ def run_trace(
     state = initial_state(qubits, basis)
     trace: list[dict[str, Any]] = []
     measurements: list[dict[str, Any]] = []
+    outcomes: dict[str, int] = {}
     for index, step in enumerate(steps):
         measured = None
-        if step["type"] == MEASURE_GATE:
-            state, outcome = measure(state, qubits, int(step["target"]), rng)
-            measured = {"target": int(step["target"]), "outcome": outcome}
-            measurements.append({"step": index, **measured})
-        else:
-            state = apply_gate(state, qubits, step)
+        effective, fired, is_conditional = resolve_step(step, outcomes)
+        if effective:
+            if effective["type"] == MEASURE_GATE:
+                state, outcome = measure(state, qubits, int(effective["target"]), rng)
+                measured = {"target": int(effective["target"]), "outcome": outcome}
+                measurements.append({"step": index, **measured})
+                outcomes[int(effective["target"])] = outcome
+            else:
+                state = apply_gate(state, qubits, effective)
         trace.append(
             {
                 "index": index,
                 "type": step["type"],
                 "measured": measured,
+                "condition_fired": fired if is_conditional else None,
                 "probabilities": probability_map(state, qubits),
             }
         )
@@ -245,7 +311,7 @@ def ideal_probabilities(
     """Probabilities of the ideal circuit with measurements omitted."""
     state = initial_state(qubits, basis)
     for step in steps:
-        if step["type"] != MEASURE_GATE:
+        if step["type"] not in (MEASURE_GATE, CONDITIONAL_GATE):
             state = apply_gate(state, qubits, step)
     return probability_map(state, qubits)
 
@@ -261,12 +327,17 @@ def run_experiment(
     counts = {label: 0 for label in _basis_labels(qubits)}
     for _ in range(shots):
         state = initial_state(qubits, basis)
+        outcomes: dict[str, int] = {}
         for step in steps:
-            if step["type"] == MEASURE_GATE:
-                target = int(step["target"])
+            effective, _fired, _cond = resolve_step(step, outcomes)
+            if not effective:
+                continue
+            if effective["type"] == MEASURE_GATE:
+                target = int(effective["target"])
                 state, outcome = measure(state, qubits, target, rng)
+                outcomes[target] = outcome
             else:
-                state = apply_gate(state, qubits, step)
+                state = apply_gate(state, qubits, effective)
         probs = probabilities(state)
         index = int(rng.choice(len(probs), p=probs))
         label = format(index, f"0{qubits}b")

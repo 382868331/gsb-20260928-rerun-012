@@ -12,7 +12,10 @@ interface Props {
 
 const GATE_LABEL: Record<string, string> = {
   MEASURE: "测量 M",
+  IF: "条件执行 IF",
 };
+
+const INNER_GATE_TYPES = ["H", "X", "Y", "Z", "S", "T", "RX", "RY", "RZ"] as const;
 
 export function StepEditor({ step, index, qubits, errors, executedThrough }: Props) {
   const { updateStep, removeStep, moveStep } = useBenchStore();
@@ -80,6 +83,64 @@ export function StepEditor({ step, index, qubits, errors, executedThrough }: Pro
                 onChange={(event) => updateStep(step.id, { angle: Number(event.target.value) })}
               />
             </label>
+          </>
+        )}
+        {step.type === "IF" && (
+          <>
+            <QubitSelect label="条件量子位（已测量）" valueKey="control" />
+            <label className="field">
+              等于
+              <select
+                value={step.equals ?? 1}
+                onChange={(event) => updateStep(step.id, { equals: Number(event.target.value) as 0 | 1 })}
+              >
+                <option value={1}>1</option>
+                <option value={0}>0</option>
+              </select>
+            </label>
+            <label className="field">
+              满足时执行
+              <select
+                value={step.then?.type ?? "X"}
+                onChange={(event) =>
+                  updateStep(step.id, {
+                    then: { id: step.then?.id ?? "", type: event.target.value as never, target: step.then?.target ?? 0, angle: step.then?.angle },
+                  })
+                }
+              >
+                {INNER_GATE_TYPES.map((gate) => (
+                  <option key={gate} value={gate}>{gate}</option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              作用量子位
+              <select
+                value={step.then?.target ?? 0}
+                onChange={(event) =>
+                  updateStep(step.id, { then: { ...step.then!, target: Number(event.target.value) } })
+                }
+              >
+                {qubitOptions.map((q) => (
+                  <option key={q} value={q}>q{q}</option>
+                ))}
+              </select>
+            </label>
+            {(step.then?.type === "RX" || step.then?.type === "RY" || step.then?.type === "RZ") && (
+              <label className="field">
+                角度 (弧度)
+                <input
+                  type="number"
+                  step="0.01"
+                  value={step.then.angle ?? 0}
+                  onChange={(event) =>
+                    updateStep(step.id, {
+                      then: { ...step.then!, angle: Number(event.target.value) },
+                    })
+                  }
+                />
+              </label>
+            )}
           </>
         )}
       </div>

@@ -5,7 +5,7 @@ const GROUPS: Array<{ label: string; gates: GateType[] }> = [
   { label: "单量子位门", gates: ["H", "X", "Y", "Z", "S", "T"] },
   { label: "旋转门", gates: ["RX", "RY", "RZ"] },
   { label: "双量子位门", gates: ["CNOT", "CZ", "SWAP"] },
-  { label: "测量", gates: ["MEASURE"] },
+  { label: "测量与条件", gates: ["MEASURE", "IF"] },
 ];
 
 export function GatePalette() {
@@ -19,7 +19,7 @@ export function GatePalette() {
           <div className="gate-row">
             {group.gates.map((gate) => (
               <button key={gate} type="button" className="gate-button" onClick={() => addStep(gate)}>
-                {gate === "MEASURE" ? "测量" : gate}
+                {gate === "MEASURE" ? "测量" : gate === "IF" ? "条件 IF" : gate}
               </button>
             ))}
           </div>

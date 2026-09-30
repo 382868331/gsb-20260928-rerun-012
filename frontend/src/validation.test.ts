@@ -11,6 +11,15 @@ describe("supported gate range", () => {
     expect(quantum.maxQubits).toBe(4);
   });
 
+  it("creates a conditional step with a prior-measurement control and inner gate", () => {
+    const conditional = makeStep("IF", 2);
+    expect(conditional.type).toBe("IF");
+    expect(conditional.control).toBe(0);
+    expect(conditional.equals).toBe(1);
+    expect(conditional.then?.type).toBe("X");
+    expect(conditional.then?.target).toBe(1);
+  });
+
   it("declares the complete first-round operation set", () => {
     expect(quantum.singleQubitGates).toEqual(["H", "X", "Y", "Z", "S", "T"]);
     expect(quantum.paramGates).toEqual(["RX", "RY", "RZ"]);

@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { advanceSession, createSession } from "./api";
+import { CheckpointPanel } from "./components/CheckpointPanel";
 import { ControlBar } from "./components/ControlBar";
 import { GatePalette } from "./components/GatePalette";
 import { ProbabilityPanel } from "./components/ProbabilityPanel";
@@ -13,6 +14,9 @@ export default function App() {
   const [errors, setErrors] = useState<ValidationError[]>([]);
   const [session, setSession] = useState<SessionState | null>(null);
   const [runtimeError, setRuntimeError] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
 
   const handleValidation = useCallback((next: ValidationError[]) => {
     setErrors(next);
@@ -23,16 +27,25 @@ export default function App() {
   useEffect(() => {
     setSession(null);
     setRuntimeError("");
+    setStatusMessage("");
   }, [qubits, initialBasis, seed, steps]);
 
   async function start() {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
     setRuntimeError("");
+    setStatusMessage("");
     try {
       const created = await createSession(circuit);
-      setSession(await advanceSession(created.session_id));
+      setSession(created);
+      setStatusMessage(`已开始并执行第 1 步（共 ${created.total_steps} 步）`);
     } catch (err) {
       const payload = err as { errors?: Array<{ message: string }>; error?: string };
       setRuntimeError(payload.errors?.map((item) => item.message).join("; ") ?? payload.error ?? "启动失败");
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
     }
   }
 
@@ -41,19 +54,41 @@ export default function App() {
       await start();
       return;
     }
-    if (session.finished) return;
+    if (session.finished) {
+      setStatusMessage("线路已经运行结束，没有下一步可执行；可重置后重新开始。");
+      return;
+    }
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
     setRuntimeError("");
+    setStatusMessage("");
     try {
-      setSession(await advanceSession(session.session_id));
+      const advanced = await advanceSession(session.session_id);
+      setSession(advanced);
+      setStatusMessage(
+        advanced.finished
+          ? `第 ${advanced.total_steps} 步已执行，线路运行结束`
+          : `已执行第 ${advanced.next_index} 步`,
+      );
     } catch (err) {
-      const payload = err as { error?: string };
-      setRuntimeError(payload.error ?? "执行失败");
+      const payload = err as { status?: number; error?: string; finished?: boolean; next_index?: number };
+      if (payload.status === 409 && payload.finished) {
+        setSession({ ...session, finished: true, next_index: payload.next_index ?? session.next_index });
+        setStatusMessage("线路已经运行结束，没有下一步可执行；可重置后重新开始。");
+      } else {
+        setRuntimeError(payload.error ?? "执行失败");
+      }
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
     }
   }
 
   function reset() {
     setSession(null);
     setRuntimeError("");
+    setStatusMessage("");
   }
 
   return (
@@ -69,11 +104,12 @@ export default function App() {
         onStart={start}
         onStep={nextStep}
         onReset={reset}
-        running={false}
-        canStep={errors.length === 0 && (!session || !session.finished)}
+        running={busy}
+        canStep={errors.length === 0 && !busy}
       />
 
       {runtimeError && <div className="error-box">{runtimeError}</div>}
+      {statusMessage && <div className="status-box">{statusMessage}</div>}
 
       <div className="workspace-grid">
         <div className="left-column">
@@ -96,6 +132,21 @@ export default function App() {
         </div>
         <div className="right-column">
           <ProbabilityPanel session={session} initialBasis={initialBasis} qubits={qubits} />
+          <CheckpointPanel
+            session={session}
+            onResume={(resumed) => {
+              setSession(resumed);
+              setStatusMessage(
+                `已从检查点恢复：保留 ${resumed.restored_measurements?.length ?? 0} 条历史测量，从第 ${resumed.next_index + 1} 步继续`,
+              );
+            }}
+            onError={setRuntimeError}
+            busy={busy}
+            setBusy={(value) => {
+              busyRef.current = value;
+              setBusy(value);
+            }}
+          />
           <StatsPanel disabled={errors.length > 0} />
         </div>
       </div>

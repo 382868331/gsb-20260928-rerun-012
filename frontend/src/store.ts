@@ -9,7 +9,11 @@ export function newStepId(): string {
 
 export function makeStep(type: GateType, qubits: number): CircuitStep {
   const step: CircuitStep = { id: newStepId(), type };
-  if (type === "CNOT" || type === "CZ") {
+  if (type === "IF") {
+    step.control = 0;
+    step.equals = 1;
+    step.then = { id: newStepId(), type: "X", target: Math.min(1, qubits - 1) };
+  } else if (type === "CNOT" || type === "CZ") {
     step.control = 0;
     step.target = Math.min(1, qubits - 1);
   } else if (type === "SWAP") {
@@ -57,6 +61,13 @@ export const useBenchStore = create<BenchState>((set) => ({
               if (typeof next[key] === "number" && (next[key] as number) >= qubits) {
                 next[key] = qubits - 1;
               }
+            }
+            if (next.then) {
+              const inner = { ...next.then };
+              if (typeof inner.target === "number" && inner.target >= qubits) {
+                inner.target = qubits - 1;
+              }
+              next.then = inner;
             }
             return next;
           }),

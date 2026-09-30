@@ -71,6 +71,11 @@ input, select {
 .measurements { margin-top: 12px; padding-top: 10px; border-top: 1px solid #e5ebf3; font-size: 13px; }
 .measurements ul { margin: 8px 0 0; padding-left: 18px; }
 .error-box { background: #fff0f0; border: 1px solid #efb1b1; color: #a92828; padding: 10px 12px; border-radius: 10px; margin: 10px 0; font-size: 13px; }
+.status-box { background: #eef6ff; border: 1px solid #a9cdf3; color: #16529a; padding: 10px 12px; border-radius: 10px; margin: 10px 0; font-size: 13px; }
+.branch-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.branch-grid textarea { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; resize: vertical; }
+.compare-result { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
+.compare-result ul { columns: 2; padding-left: 16px; font-size: 12px; }
 
 @media (max-width: 900px) {
   .workspace-grid { grid-template-columns: 1fr; }
