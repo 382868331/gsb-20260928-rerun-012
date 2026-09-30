@@ -71,6 +71,36 @@ export interface BranchComparison {
   branches: [BranchResult, BranchResult];
 }
 
+export interface BranchExperimentBranch {
+  branch_id: string;
+  label: string;
+  condition_steps: Array<Record<string, unknown>>;
+  shots: number;
+  counts: Record<string, number>;
+  frequencies: Record<string, number>;
+  sample_source: string;
+}
+
+export interface BranchExperiment {
+  run_id: string;
+  name: string;
+  budget: number;
+  root_seed: number;
+  created_at: number;
+  updated_at: number;
+  checkpoint: {
+    checkpoint_id: string;
+    name: string;
+    qubits: number;
+    initial_basis: string;
+    prefix_steps: Array<Record<string, unknown>>;
+    prefix_next_index: number;
+    prefix_probabilities: Record<string, number>;
+    measurements: Array<{ step: number; target: number; outcome: number }>;
+  };
+  branches: BranchExperimentBranch[];
+}
+
 export interface ExperimentResult {
   shots: number;
   seed: number | null;

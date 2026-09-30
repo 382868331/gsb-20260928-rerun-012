@@ -1,8 +1,14 @@
 import { useState } from "react";
 import { Trash2 } from "lucide-react";
-import { compareBranches } from "../api";
+import { appendBranchShots, compareBranches, createBranchExperiment, getBranchExperiment } from "../api";
 import { newStepId } from "../store";
-import type { BranchComparison, CheckpointState, CircuitStep, GateType } from "../types";
+import type {
+  BranchComparison,
+  BranchExperiment,
+  CheckpointState,
+  CircuitStep,
+  GateType,
+} from "../types";
 
 interface Props {
   checkpoints: CheckpointState[];
@@ -22,6 +28,12 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<BranchComparison | null>(null);
+  const [batchShots, setBatchShots] = useState(100);
+  const [batchBudget, setBatchBudget] = useState(100);
+  const [appendShots, setAppendShots] = useState(100);
+  const [appendBudget, setAppendBudget] = useState(100);
+  const [runId, setRunId] = useState("");
+  const [experiment, setExperiment] = useState<BranchExperiment | null>(null);
 
   const checkpoint = checkpoints.find((item) => item.checkpoint_id === checkpointId) ?? null;
   const qubits = checkpoint?.qubits ?? 1;
@@ -46,6 +58,61 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
     } catch (err) {
       const payload = err as { errors?: Array<{ message: string }>; error?: string };
       setError(payload.errors?.map((item) => item.message).join("; ") ?? payload.error ?? "比较失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runBranches() {
+    if (!checkpoint || loading) return;
+    setLoading(true);
+    setError("");
+    try {
+      const created = await createBranchExperiment(
+        checkpointId,
+        [
+          { label: "分支 A", steps: branchA },
+          { label: "分支 B", steps: branchB },
+        ],
+        { shots: batchShots, budget: Math.max(batchBudget, batchShots), seed: null },
+      );
+      setRunId(created.run_id);
+      setBatchBudget(created.budget);
+      setAppendBudget(created.budget);
+      setExperiment(created);
+    } catch (err) {
+      const payload = err as { errors?: Array<{ message: string }>; error?: string };
+      setError(payload.errors?.map((item) => item.message).join("; ") ?? payload.error ?? "分支统计失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function resumeRun() {
+    if (!runId.trim() || loading) return;
+    setLoading(true);
+    setError("");
+    try {
+      const restored = await getBranchExperiment(runId.trim());
+      setExperiment(restored);
+      setAppendBudget(restored.budget);
+    } catch (err) {
+      const payload = err as { error?: string };
+      setError(payload.error ?? "恢复分支统计失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function addShots() {
+    if (!experiment || loading) return;
+    setLoading(true);
+    setError("");
+    try {
+      setExperiment(await appendBranchShots(experiment.run_id, appendShots, Math.max(experiment.budget, appendBudget)));
+    } catch (err) {
+      const payload = err as { error?: string };
+      setError(payload.error ?? "追加样本失败");
     } finally {
       setLoading(false);
     }
@@ -76,9 +143,54 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
             <button type="button" className="primary" onClick={runCompare} disabled={disabled || loading}>
               {loading ? "比较中…" : "比较两个后续分支"}
             </button>
+            <button type="button" onClick={runBranches} disabled={disabled || loading}>
+              运行独立分支统计
+            </button>
             <span className="muted">可添加的门：{BRANCH_GATES.join(" / ")}</span>
           </div>
+          <div className="inline-controls">
+            <label className="field">
+              本次样本
+              <input type="number" min={0} max={100000} value={batchShots} onChange={(event) => setBatchShots(Number(event.target.value))} />
+            </label>
+            <label className="field">
+              预算上限
+              <input type="number" min={1} max={100000} value={batchBudget} onChange={(event) => setBatchBudget(Number(event.target.value))} />
+            </label>
+          </div>
           {error && <div className="error-box">{error}</div>}
+          {experiment && (
+            <div className="branch-result saved-branch">
+              <div className="inline-controls">
+                <strong>独立分支统计：{experiment.run_id}</strong>
+                <input value={runId} onChange={(event) => setRunId(event.target.value)} aria-label="分支统计运行 ID" />
+                <button type="button" onClick={resumeRun} disabled={loading}>单独恢复</button>
+                <input type="number" min={1} max={100000} value={appendShots} onChange={(event) => setAppendShots(Number(event.target.value))} aria-label="追加样本数" />
+                <input type="number" min={experiment.budget} max={100000} value={appendBudget} onChange={(event) => setAppendBudget(Number(event.target.value))} aria-label="新预算上限" />
+                <button type="button" onClick={addShots} disabled={loading}>追加样本</button>
+              </div>
+              <p className="muted">
+                共同前缀：保存点「{experiment.checkpoint.name}」前 {experiment.checkpoint.prefix_next_index} 步，
+                测量 {JSON.stringify(experiment.checkpoint.measurements)}；各分支结果仅统计自身样本来源。
+              </p>
+              <div className="branch-grid">
+                {experiment.branches.map((branch) => (
+                  <div key={branch.branch_id}>
+                    <strong>{branch.label}</strong>
+                    <p className="muted">条件：{branch.condition_steps.length ? JSON.stringify(branch.condition_steps) : "无操作"}</p>
+                    <p className="muted">样本数 {branch.shots}；来源 {branch.sample_source}</p>
+                    <div className="prob-compact">
+                      {Object.entries(branch.frequencies).map(([label, value]) => (
+                        <span key={label} className={value > 0 ? "prob-hot" : ""}>
+                          |{label}⟩ {(value * 100).toFixed(1)}% ({branch.counts[label]})
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {result && (
             <div className="branch-results">
               {result.branches.map((branch) => (

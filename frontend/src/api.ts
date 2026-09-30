@@ -1,5 +1,6 @@
 import type {
   BranchComparison,
+  BranchExperiment,
   CheckpointState,
   CircuitStep,
   Circuit,
@@ -55,6 +56,31 @@ export function compareBranches(
 
 function stripIds(steps: CircuitStep[]) {
   return steps.map(({ id: _id, ...rest }) => rest);
+}
+
+export function createBranchExperiment(
+  checkpointId: string,
+  branches: Array<{ label: string; steps: CircuitStep[] }>,
+  options: { shots: number; budget: number; seed: number | null; name?: string },
+) {
+  return request<BranchExperiment>(`/api/checkpoints/${checkpointId}/branch-runs`, "POST", {
+    name: options.name,
+    shots: options.shots,
+    budget: options.budget,
+    seed: options.seed,
+    branches: branches.map((branch) => ({ label: branch.label, steps: stripIds(branch.steps) })),
+  });
+}
+
+export function getBranchExperiment(runId: string) {
+  return request<BranchExperiment>(`/api/branch-runs/${encodeURIComponent(runId)}`, "GET");
+}
+
+export function appendBranchShots(runId: string, shots: number, budget?: number) {
+  return request<BranchExperiment>(`/api/branch-runs/${encodeURIComponent(runId)}/shots`, "POST", {
+    shots,
+    ...(budget === undefined ? {} : { budget }),
+  });
 }
 
 export function runExperiment(circuit: Circuit, shots: number) {
