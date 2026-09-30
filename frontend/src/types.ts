@@ -36,6 +36,39 @@ export interface SessionState {
   probabilities: Record<string, number>;
   measurements: Array<{ step: number; target: number; outcome: number }>;
   executed?: { index: number; type: GateType; measured: { target: number; outcome: number } | null };
+  notice?: string;
+  resumed_from?: string;
+}
+
+export interface CheckpointState {
+  checkpoint_id: string;
+  session_id: string | null;
+  name: string;
+  qubits: number;
+  initial_basis: string;
+  seed: number | null;
+  next_index: number;
+  total_steps: number;
+  probabilities: Record<string, number>;
+  measurements: Array<{ step: number; target: number; outcome: number }>;
+}
+
+export interface BranchResult {
+  label: string;
+  steps: Array<{
+    index: number;
+    type: GateType;
+    measured: { target: number; outcome: number } | null;
+    probabilities: Record<string, number>;
+  }>;
+  measurements: Array<{ step: number; target: number; outcome: number }>;
+  final_probabilities: Record<string, number>;
+}
+
+export interface BranchComparison {
+  checkpoint_id: string;
+  checkpoint: CheckpointState;
+  branches: [BranchResult, BranchResult];
 }
 
 export interface ExperimentResult {
