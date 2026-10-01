@@ -69,6 +69,8 @@ export function createBranchExperiment(
       label: branch.label,
       budget: branch.budget,
       steps: stripIds(branch.steps),
+      filters: branch.filters,
+      attempt_cap: branch.attempt_cap,
     })),
   });
 }

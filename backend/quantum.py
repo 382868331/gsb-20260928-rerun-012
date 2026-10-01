@@ -265,6 +265,68 @@ def sample_continuation(
     }
 
 
+def enumerate_continuation(
+    state: np.ndarray,
+    qubits: int,
+    steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Exact joint distribution for a short continuation.
+
+    Every projective measurement is split into its two weighted branches;
+    unnormalized post-measurement vectors carry the joint probability mass.
+    A final superposition is expanded into computational-basis outcomes the
+    same way ``sample_continuation`` draws one.  Paths with zero mass are
+    omitted.  Intended for tiny circuits used to cross-check rejection
+    sampling against joint and conditional probabilities.
+    """
+    paths: list[dict[str, Any]] = []
+
+    def expand(
+        current: np.ndarray,
+        index: int,
+        mass: float,
+        measurements: list[dict[str, Any]],
+    ) -> None:
+        if index == len(steps):
+            for basis_index, amplitude in enumerate(current):
+                weight = mass * float(abs(amplitude) ** 2)
+                if weight <= 0.0:
+                    continue
+                paths.append(
+                    {
+                        "sample": format(basis_index, f"0{qubits}b"),
+                        "measurements": [dict(item) for item in measurements],
+                        "probability": weight,
+                    }
+                )
+            return
+        step = steps[index]
+        if step["type"] != MEASURE_GATE:
+            expand(apply_gate(current, qubits, step), index + 1, mass, measurements)
+            return
+        target = int(step["target"])
+        tensor = current.reshape((2,) * qubits)
+        moved = np.moveaxis(tensor, target, 0)
+        for outcome in (0, 1):
+            branch = np.zeros_like(moved)
+            branch[outcome] = moved[outcome]
+            branch_mass = float(np.sum(np.abs(branch) ** 2))
+            if branch_mass <= 0.0:
+                continue
+            norm = math.sqrt(branch_mass)
+            collapsed = np.moveaxis(branch / norm, 0, target).reshape(-1)
+            record = {"step": index, "target": target, "outcome": outcome}
+            expand(
+                collapsed,
+                index + 1,
+                mass * branch_mass,
+                [*measurements, record],
+            )
+
+    expand(np.array(state, dtype=complex, copy=True), 0, 1.0, [])
+    return paths
+
+
 def ideal_probabilities(
     qubits: int, basis: str, steps: list[dict[str, Any]]
 ) -> dict[str, float]:

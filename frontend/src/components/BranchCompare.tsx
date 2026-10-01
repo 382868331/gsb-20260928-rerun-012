@@ -2,7 +2,13 @@ import { useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { addBranchShots, createBranchExperiment, getBranchExperiment } from "../api";
 import { newStepId } from "../store";
-import type { BranchExperiment, CheckpointState, CircuitStep, GateType } from "../types";
+import type {
+  BranchExperiment,
+  CheckpointState,
+  CircuitStep,
+  GateType,
+  MeasurementFilter,
+} from "../types";
 
 interface Props {
   checkpoints: CheckpointState[];
@@ -15,6 +21,7 @@ interface BranchDraft {
   budget: number;
   nextShots: number;
   steps: CircuitStep[];
+  filters: MeasurementFilter[];
 }
 
 const BRANCH_GATES: GateType[] = ["H", "X", "Y", "Z", "CNOT", "CZ", "MEASURE"];
@@ -38,9 +45,20 @@ function defaultBranches(qubits: number): BranchDraft[] {
       budget: 256,
       nextShots: 256,
       steps: [{ id: newStepId(), type: "X", target: Math.min(1, qubits - 1) }],
+      filters: [],
     },
-    { id: "branch-2", label: "条件操作 B", budget: 256, nextShots: 256, steps: [] },
+    { id: "branch-2", label: "条件操作 B", budget: 256, nextShots: 256, steps: [], filters: [] },
   ];
+}
+
+function updateFilter(
+  filters: MeasurementFilter[],
+  index: number,
+  patch: Partial<MeasurementFilter>,
+): MeasurementFilter[] {
+  return filters.map((filter, filterIndex) =>
+    filterIndex === index ? { ...filter, ...patch } : filter,
+  );
 }
 
 export function BranchCompare({ checkpoints, disabled }: Props) {
@@ -91,6 +109,7 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
             label: branch.label.trim(),
             budget: branch.budget,
             steps: branch.steps,
+            filters: branch.filters.length ? branch.filters : undefined,
           })),
           { seed: checkpoint.seed },
         ),
@@ -137,6 +156,7 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
           budget: branch.budget,
           nextShots: 256,
           steps: branch.condition_steps.map((step) => ({ ...(step as CircuitStep), id: newStepId() })),
+          filters: branch.filters.map((filter) => ({ ...filter })),
         })),
       );
     } catch (err) {
@@ -196,6 +216,7 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
                     budget: 256,
                     nextShots: 256,
                     steps: [makeGate(checkpoint.qubits)],
+                    filters: [],
                   },
                 ])
               }
@@ -239,6 +260,41 @@ function BranchEditor({ branch, qubits, canRemove, onUpdate, onRemove, onStep }:
         初始样本预算
         <input type="number" min={0} max={100000} value={branch.budget} onChange={(event) => onUpdate({ budget: Number(event.target.value) })} />
       </label>
+      <div className="filter-block">
+        <span className="muted">只保留中途测量结果（按顺序连续筛选）</span>
+        {branch.filters.map((filter, filterIndex) => (
+          <div key={filterIndex} className="branch-step">
+            <span className="step-index">筛选 {filterIndex + 1}</span>
+            <select
+              value={filter.target}
+              onChange={(event) => onUpdate({ filters: updateFilter(branch.filters, filterIndex, { target: Number(event.target.value) }) })}
+            >
+              {options.map((q) => <option key={q} value={q}>q{q}</option>)}
+            </select>
+            <span>=</span>
+            <select
+              value={filter.outcome}
+              onChange={(event) => onUpdate({ filters: updateFilter(branch.filters, filterIndex, { outcome: Number(event.target.value) as 0 | 1 }) })}
+            >
+              <option value={0}>0</option>
+              <option value={1}>1</option>
+            </select>
+            <button
+              type="button"
+              aria-label="删除筛选"
+              onClick={() => onUpdate({ filters: branch.filters.filter((_, index) => index !== filterIndex) })}
+            >
+              <Trash2 size={12} />
+            </button>
+          </div>
+        ))}
+        <button
+          type="button"
+          onClick={() => onUpdate({ filters: [...branch.filters, { target: 0, outcome: 0 }] })}
+        >
+          + 测量筛选
+        </button>
+      </div>
       {branch.steps.map((step, stepIndex) => (
         <div key={step.id} className="branch-step">
           <span className="step-index">#{stepIndex + 1}</span>
@@ -295,14 +351,48 @@ function ExperimentResult({
         return (
           <div key={branch.branch_id} className="branch-result">
             <strong>{branch.label}</strong>
-            <p className="muted">样本来源：{branch.batches.map((batch) => `${batch.source}(${batch.shots})`).join(" + ")}；共 {branch.completed_shots} 个独立样本。</p>
-            <div className="prob-compact">
-              {Object.entries(branch.frequencies).map(([label, value]) => (
-                <span key={label} className={value > 0 ? "prob-hot" : ""}>
-                  |{label}⟩ {branch.counts[label]}（{(value * 100).toFixed(1)}%）
-                </span>
-              ))}
-            </div>
+            <p className="muted">
+              样本范围：{branch.sample_scope}。筛选条件：
+              {branch.filters.length
+                ? branch.filters.map((filter) => `q${filter.target}=${filter.outcome}`).join("，")
+                : "无"}
+            </p>
+            <p className="muted">
+              总尝试数 {branch.total_attempts}；通过筛选 {branch.passed_shots}；未通过 {branch.rejected_shots}。
+              批次：{branch.batches
+                .map((batch) => `${batch.source}(尝试 ${batch.attempts}/通过 ${batch.accepted_shots})`)
+                .join(" + ")}
+            </p>
+            {branch.filters.length > 0 && (
+              <p className="muted">
+                各筛选阶段未通过数：{branch.stage_rejected.map((count, index) => `筛选 ${index + 1}: ${count}`).join("；")}
+              </p>
+            )}
+            {branch.cap_reached && (
+              <div className="error-box">尝试上限已用完，当前条件仍没有足够命中；以下分布只代表已通过筛选的样本。</div>
+            )}
+            {branch.frequencies === null ? (
+              <div className="notice-box">
+                没有任何样本通过筛选：目前没有证据，不能解释为各结果概率均为 0。精确理论接受概率为
+                {(branch.exact.accepted_probability * 100).toFixed(2)}%。
+              </div>
+            ) : (
+              <div className="prob-compact">
+                {Object.entries(branch.frequencies).map(([label, value]) => (
+                  <span key={label} className={value > 0 ? "prob-hot" : ""}>
+                    |{label}⟩ {branch.counts[label]}（{(value * 100).toFixed(1)}%）
+                  </span>
+                ))}
+              </div>
+            )}
+            <p className="muted">
+              短线路精确枚举：联合接受概率 {(branch.exact.accepted_probability * 100).toFixed(2)}%
+              {branch.exact.conditional_probabilities
+                ? `；条件分布 ${Object.entries(branch.exact.conditional_probabilities)
+                    .map(([label, value]) => `|${label}⟩=${(value * 100).toFixed(1)}%`)
+                    .join("，")}`
+                : "；条件概率无定义（筛选事件概率为 0）"}
+            </p>
             <ContinueShots branchId={branch.branch_id} defaultValue={draft?.nextShots ?? 256} busy={busy} loading={loadingId} onContinue={onContinue} />
           </div>
         );

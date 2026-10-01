@@ -283,6 +283,8 @@ def _branch_specs_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "branch_id": str(raw.get("branch_id") or f"branch-{index + 1}"),
                 "label": raw.get("label") or f"分支 {index + 1}",
                 "steps": raw["steps"],
+                "filters": raw.get("filters"),
+                "attempt_cap": raw.get("attempt_cap"),
                 "budget": raw.get("budget", int(payload.get("shots", 0))),
             }
         )
@@ -568,6 +570,10 @@ class Handler(BaseHTTPRequestHandler):
                     for spec in specs:
                         if not 0 <= int(spec["budget"]) <= 100_000:
                             raise ValueError("each branch budget must be in [0, 100000]")
+                        if spec.get("attempt_cap") is not None:
+                            attempt_cap = int(spec["attempt_cap"])
+                            if not 1 <= attempt_cap <= 10_000_000:
+                                raise ValueError("attempt_cap must be in [1, 10000000]")
                 except ValueError as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
