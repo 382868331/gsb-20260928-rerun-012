@@ -73,6 +73,7 @@ input, select {
 .branch-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .branch-step { display: flex; gap: 6px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
 .branch-step select { padding: 4px 6px; }
+.filter-editor { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-top: 6px; border-top: 1px dashed #d5dce8; }
 .branch-results { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
 .branch-result { border: 1px solid #dfe6f0; border-radius: 10px; padding: 10px; background: #fafcff; }
 .branch-result ul { margin: 6px 0; padding-left: 18px; }

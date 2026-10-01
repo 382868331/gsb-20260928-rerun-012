@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { addBranchShots, createBranchExperiment, getBranchExperiment } from "../api";
 import { newStepId } from "../store";
-import type { BranchExperiment, CheckpointState, CircuitStep, GateType } from "../types";
+import type { BranchExperiment, CheckpointState, CircuitStep, GateType, MeasurementFilter } from "../types";
 
 interface Props {
   checkpoints: CheckpointState[];
@@ -15,6 +15,7 @@ interface BranchDraft {
   budget: number;
   nextShots: number;
   steps: CircuitStep[];
+  filters: MeasurementFilter[];
 }
 
 const BRANCH_GATES: GateType[] = ["H", "X", "Y", "Z", "CNOT", "CZ", "MEASURE"];
@@ -38,9 +39,14 @@ function defaultBranches(qubits: number): BranchDraft[] {
       budget: 256,
       nextShots: 256,
       steps: [{ id: newStepId(), type: "X", target: Math.min(1, qubits - 1) }],
+      filters: [],
     },
-    { id: "branch-2", label: "条件操作 B", budget: 256, nextShots: 256, steps: [] },
+    { id: "branch-2", label: "条件操作 B", budget: 256, nextShots: 256, steps: [], filters: [] },
   ];
+}
+
+function pruneFilters(steps: CircuitStep[], filters: MeasurementFilter[]): MeasurementFilter[] {
+  return filters.filter((filter) => steps[filter.step]?.type === "MEASURE");
 }
 
 export function BranchCompare({ checkpoints, disabled }: Props) {
@@ -55,7 +61,13 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
   const busy = disabled || loadingId !== "";
 
   function updateBranch(id: string, patch: Partial<BranchDraft>) {
-    setBranches((prev) => prev.map((branch) => (branch.id === id ? { ...branch, ...patch } : branch)));
+    setBranches((prev) =>
+      prev.map((branch) => {
+        if (branch.id !== id) return branch;
+        const next = { ...branch, ...patch };
+        return { ...next, filters: pruneFilters(next.steps, next.filters) };
+      }),
+    );
   }
 
   function updateStep(branchId: string, stepId: string, patch: Partial<CircuitStep>) {
@@ -91,6 +103,7 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
             label: branch.label.trim(),
             budget: branch.budget,
             steps: branch.steps,
+            filters: branch.filters,
           })),
           { seed: checkpoint.seed },
         ),
@@ -137,6 +150,7 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
           budget: branch.budget,
           nextShots: 256,
           steps: branch.condition_steps.map((step) => ({ ...(step as CircuitStep), id: newStepId() })),
+          filters: branch.filters ?? [],
         })),
       );
     } catch (err) {
@@ -196,6 +210,7 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
                     budget: 256,
                     nextShots: 256,
                     steps: [makeGate(checkpoint.qubits)],
+                    filters: [],
                   },
                 ])
               }
@@ -265,6 +280,32 @@ function BranchEditor({ branch, qubits, canRemove, onUpdate, onRemove, onStep }:
         </div>
       ))}
       <button type="button" onClick={() => onUpdate({ steps: [...branch.steps, makeGate(qubits)] })}>+ 条件步骤</button>
+      {branch.steps.some((step) => step.type === "MEASURE") && (
+        <div className="filter-editor">
+          <span className="muted">测量筛选（只统计命中样本）：</span>
+          {branch.steps.map((step, stepIndex) =>
+            step.type === "MEASURE" ? (
+              <label key={step.id} className="field">
+                第 {stepIndex + 1} 步 q{step.target ?? 0} 测量
+                <select
+                  value={branch.filters.find((filter) => filter.step === stepIndex)?.outcome ?? ""}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    const rest = branch.filters.filter((filter) => filter.step !== stepIndex);
+                    onUpdate({
+                      filters: value === "" ? rest : [...rest, { step: stepIndex, outcome: Number(value) as 0 | 1 }],
+                    });
+                  }}
+                >
+                  <option value="">不筛选</option>
+                  <option value="0">只保留 =0</option>
+                  <option value="1">只保留 =1</option>
+                </select>
+              </label>
+            ) : null,
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -295,14 +336,30 @@ function ExperimentResult({
         return (
           <div key={branch.branch_id} className="branch-result">
             <strong>{branch.label}</strong>
-            <p className="muted">样本来源：{branch.batches.map((batch) => `${batch.source}(${batch.shots})`).join(" + ")}；共 {branch.completed_shots} 个独立样本。</p>
-            <div className="prob-compact">
-              {Object.entries(branch.frequencies).map(([label, value]) => (
-                <span key={label} className={value > 0 ? "prob-hot" : ""}>
-                  |{label}⟩ {branch.counts[label]}（{(value * 100).toFixed(1)}%）
-                </span>
-              ))}
-            </div>
+            <p className="muted">
+              样本范围：{branch.sample_scope}。样本来源：
+              {branch.batches.map((batch) => batch.source + "(" + batch.shots + ")").join(" + ")}。
+            </p>
+            <p className="muted">
+              总尝试 {branch.attempts} 次
+              {branch.filters.length > 0 &&
+                "，通过筛选 " + branch.passed_shots + " 次（" +
+                (branch.pass_rate === null ? "—" : (branch.pass_rate * 100).toFixed(1) + "%") + "）"}
+              ；筛选条件修改后需另建方案，旧样本不计入新条件。
+            </p>
+            {branch.filters.length > 0 && !branch.has_evidence ? (
+              <div className="notice-box">
+                没有样本通过筛选：当前没有证据，条件分布未知（这不是全零概率结论）。
+              </div>
+            ) : (
+              <div className="prob-compact">
+                {Object.entries(branch.frequencies ?? {}).map(([label, value]) => (
+                  <span key={label} className={value > 0 ? "prob-hot" : ""}>
+                    |{label}⟩ {branch.counts[label]}（{((value ?? 0) * 100).toFixed(1)}%）
+                  </span>
+                ))}
+              </div>
+            )}
             <ContinueShots branchId={branch.branch_id} defaultValue={draft?.nextShots ?? 256} busy={busy} loading={loadingId} onContinue={onContinue} />
           </div>
         );

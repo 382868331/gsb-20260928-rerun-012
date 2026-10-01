@@ -75,17 +75,29 @@ export interface BranchExperimentSpec {
   branch_id?: string;
   label: string;
   steps: CircuitStep[];
+  filters?: MeasurementFilter[];
   budget: number;
+}
+
+export interface MeasurementFilter {
+  step: number;
+  outcome: 0 | 1;
 }
 
 export interface BranchExperimentResult {
   branch_id: string;
   label: string;
   condition_steps: Array<Omit<CircuitStep, "id">>;
+  filters: MeasurementFilter[];
   budget: number;
   completed_shots: number;
+  attempts: number;
+  passed_shots: number;
+  pass_rate: number | null;
+  has_evidence: boolean;
+  sample_scope: string;
   counts: Record<string, number>;
-  frequencies: Record<string, number>;
+  frequencies: Record<string, number> | null;
   batches: Array<{ batch_id: string; source: string; shots: number; total_shots_after_batch: number }>;
 }
 

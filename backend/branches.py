@@ -55,6 +55,42 @@ def _branch_seed(base_seed: int, branch_id: str) -> int:
     return int.from_bytes(digest, "big") % (2**63)
 
 
+def _normalize_filters(raw: Any, steps: list[dict[str, Any]]) -> list[dict[str, int]]:
+    """Validate measurement-outcome filters against the branch steps.
+
+    Each filter pins one MEASURE step (by index) to a required outcome.
+    Multiple filters may point at different measurement positions, which
+    composes consecutive filtering along the branch.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("filters must be a list of {step, outcome} objects")
+    normalized: list[dict[str, int]] = []
+    seen_steps: set[int] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each filter must be an object with step and outcome")
+        step = item.get("step")
+        outcome = item.get("outcome")
+        if not isinstance(step, int) or isinstance(step, bool) or not 0 <= step < len(steps):
+            raise ValueError("filter step must be an integer index into the branch steps")
+        if steps[step].get("type") != quantum.MEASURE_GATE:
+            raise ValueError("filter step must point at a MEASURE step")
+        if not isinstance(outcome, int) or isinstance(outcome, bool) or outcome not in (0, 1):
+            raise ValueError("filter outcome must be 0 or 1")
+        if step in seen_steps:
+            raise ValueError("duplicate filter for the same measurement step")
+        seen_steps.add(step)
+        normalized.append({"step": step, "outcome": int(outcome)})
+    return normalized
+
+
+def _passes_filters(filters: list[dict[str, int]], measurements: list[dict[str, Any]]) -> bool:
+    by_step = {int(entry["step"]): int(entry["outcome"]) for entry in measurements}
+    return all(by_step.get(f["step"]) == f["outcome"] for f in filters)
+
+
 class BranchExperiment:
     """Statistics for several conditional branches sharing one prefix."""
 
@@ -123,13 +159,16 @@ class BranchExperiment:
             budget = int(spec.get("budget", 0))
             if budget < 0:
                 raise ValueError("branch budget must be non-negative")
+            filters = _normalize_filters(spec.get("filters"), steps)
             rng = np.random.default_rng(_branch_seed(resolved_seed, branch_id))
             branches[branch_id] = {
                 "branch_id": branch_id,
                 "label": label,
                 "steps": steps,
+                "filters": filters,
                 "budget": budget,
                 "completed_shots": 0,
+                "passed_shots": 0,
                 "counts": {label: 0 for label in labels_for_qubits},
                 "rng_state": rng_to_json(rng),
                 "batches": [],
@@ -159,42 +198,29 @@ class BranchExperiment:
         )
         for branch_id, branch in experiment.branches.items():
             if branch["budget"]:
-                shots = int(branch["budget"])
-                state = _from_json(experiment.prefix["state"])
-                rng = rng_from_json(branch["rng_state"])
-                for _ in range(shots):
-                    result = quantum.sample_continuation(
-                        state, experiment.prefix["qubits"], branch["steps"], rng
-                    )
-                    branch["counts"][result["sample"]] += 1
-                branch["completed_shots"] = shots
-                branch["rng_state"] = rng_to_json(rng)
-                branch["batches"].append(
-                    {
-                        "batch_id": uuid.uuid4().hex,
-                        "source": "initial-budget",
-                        "shots": shots,
-                        "total_shots_after_batch": shots,
-                    }
-                )
+                experiment._sample(branch, int(branch["budget"]), source="initial-budget")
         experiment.save()
         return experiment
 
-    def add_shots(self, branch_id: str, shots: int, *, source: str = "continued") -> dict[str, Any]:
-        if branch_id not in self.branches:
-            raise KeyError(f"unknown branch: {branch_id}")
-        shots = int(shots)
-        if shots <= 0:
-            raise ValueError("shots must be positive")
-        branch = self.branches[branch_id]
+    def _sample(self, branch: dict[str, Any], shots: int, *, source: str) -> dict[str, Any]:
+        """Run shots for one branch, keeping attempt identity across batches.
+
+        Every shot is an attempt. Attempts are numbered implicitly by the
+        branch RNG stream, so pausing, reloading, or appending budget never
+        re-draws or double-counts an attempt. Only attempts whose mid-circuit
+        measurements satisfy every filter enter the conditional counts.
+        """
         state = _from_json(self.prefix["state"])
         rng = rng_from_json(branch["rng_state"])
+        filters = branch.get("filters", [])
         for _ in range(shots):
             result = quantum.sample_continuation(
                 state, self.prefix["qubits"], branch["steps"], rng
             )
-            branch["counts"][result["sample"]] += 1
-        branch["completed_shots"] += shots
+            branch["completed_shots"] += 1
+            if _passes_filters(filters, result["measurements"]):
+                branch["passed_shots"] += 1
+                branch["counts"][result["sample"]] += 1
         branch["budget"] = max(int(branch["budget"]), branch["completed_shots"])
         branch["rng_state"] = rng_to_json(rng)
         batch = {
@@ -204,6 +230,16 @@ class BranchExperiment:
             "total_shots_after_batch": branch["completed_shots"],
         }
         branch["batches"].append(batch)
+        return batch
+
+    def add_shots(self, branch_id: str, shots: int, *, source: str = "continued") -> dict[str, Any]:
+        if branch_id not in self.branches:
+            raise KeyError(f"unknown branch: {branch_id}")
+        shots = int(shots)
+        if shots <= 0:
+            raise ValueError("shots must be positive")
+        branch = self.branches[branch_id]
+        batch = self._sample(branch, shots, source=source)
         self.save()
         return batch
 
@@ -232,17 +268,46 @@ class BranchExperiment:
         for branch_id in self.branch_order:
             branch = self.branches[branch_id]
             shots = int(branch["completed_shots"])
-            frequencies = {
-                label: (count / shots if shots else 0.0)
-                for label, count in branch["counts"].items()
-            }
+            filters = list(branch.get("filters", []))
+            passed = int(branch.get("passed_shots", shots))
+            effective = passed if filters else shots
+            if filters and passed == 0:
+                # No attempt satisfied the filters: report "no evidence"
+                # instead of an all-zero pseudo distribution.
+                frequencies = None
+            else:
+                frequencies = {
+                    label: (count / effective if effective else 0.0)
+                    for label, count in branch["counts"].items()
+                }
+            if filters:
+                condition = "，".join(
+                    f"第 {item['step'] + 1} 步测量结果={item['outcome']}" for item in filters
+                )
+                if passed:
+                    sample_scope = (
+                        f"仅统计满足筛选（{condition}）的 {passed}/{shots} 次尝试"
+                    )
+                else:
+                    sample_scope = (
+                        f"筛选条件（{condition}）在 {shots} 次尝试中没有命中，"
+                        "没有证据，条件分布不可用"
+                    )
+            else:
+                sample_scope = f"无筛选，统计全部 {shots} 次尝试"
             branches.append(
                 {
                     "branch_id": branch_id,
                     "label": branch["label"],
                     "condition_steps": branch["steps"],
+                    "filters": filters,
                     "budget": branch["budget"],
                     "completed_shots": shots,
+                    "attempts": shots,
+                    "passed_shots": passed,
+                    "pass_rate": (passed / shots) if shots else None,
+                    "has_evidence": (not filters) or passed > 0,
+                    "sample_scope": sample_scope,
                     "counts": dict(branch["counts"]),
                     "frequencies": frequencies,
                     "batches": list(branch["batches"]),
@@ -264,6 +329,9 @@ class BranchExperiment:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], storage_dir: str | Path) -> "BranchExperiment":
+        for branch in data["branches"].values():
+            branch.setdefault("filters", [])
+            branch.setdefault("passed_shots", int(branch.get("completed_shots", 0)))
         return cls(
             experiment_id=data["experiment_id"],
             name=data["name"],

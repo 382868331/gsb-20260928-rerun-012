@@ -58,12 +58,20 @@ def _make_checkpoint():
 def test_branch_experiment_create_get_and_patch(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "BRANCH_DIR", tmp_path)
     checkpoint = _make_checkpoint()
+    prefix_outcome = checkpoint.measurements[-1]["outcome"]
     create_payload = {
         "name": "api-branches",
         "seed": 909,
         "branches": [
             {"branch_id": "flip", "label": "flip", "steps": [{"type": "X", "target": 1}], "budget": 12},
             {"branch_id": "idle", "label": "idle", "steps": [], "budget": 8},
+            {
+                "branch_id": "keep-1",
+                "label": "keep q0=1",
+                "steps": [{"type": "MEASURE", "target": 0}],
+                "filters": [{"step": 0, "outcome": prefix_outcome}],
+                "budget": 16,
+            },
         ],
     }
     handler = DummyHandler(create_payload)
@@ -75,6 +83,11 @@ def test_branch_experiment_create_get_and_patch(monkeypatch, tmp_path):
     assert created["common_prefix"]["prefix_measurements"] == checkpoint.measurements
     assert created["branches"][0]["completed_shots"] == 12
     assert created["branches"][1]["completed_shots"] == 8
+    filtered = created["branches"][2]
+    assert filtered["attempts"] == 16
+    assert filtered["passed_shots"] == 16
+    assert filtered["has_evidence"] is True
+    assert filtered["filters"] == [{"step": 0, "outcome": prefix_outcome}]
 
     handler.path = f"/api/branch-experiments/{created['experiment_id']}"
     server.Handler.do_GET(handler)

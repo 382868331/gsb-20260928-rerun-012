@@ -283,6 +283,7 @@ def _branch_specs_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "branch_id": str(raw.get("branch_id") or f"branch-{index + 1}"),
                 "label": raw.get("label") or f"分支 {index + 1}",
                 "steps": raw["steps"],
+                "filters": raw.get("filters"),
                 "budget": raw.get("budget", int(payload.get("shots", 0))),
             }
         )
