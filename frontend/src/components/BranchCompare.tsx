@@ -1,6 +1,12 @@
 import { useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
-import { addBranchShots, createBranchExperiment, getBranchExperiment } from "../api";
+import {
+  addBranchShots,
+  createBranchExperiment,
+  createBranchInquiry,
+  getBranchExperiment,
+  runAdaptiveBatch,
+} from "../api";
 import { newStepId } from "../store";
 import type { BranchExperiment, CheckpointState, CircuitStep, GateType, MeasurementFilter } from "../types";
 
@@ -161,6 +167,42 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
     }
   }
 
+  async function addInquiry(inquiry: {
+    mode: "single" | "compare";
+    branch_ids: string[];
+    event: string;
+    margin: number;
+    total_budget: number;
+    batch_size: number;
+  }) {
+    if (!result || busy) return;
+    setLoadingId("inquiry-create");
+    setError("");
+    try {
+      await createBranchInquiry(result.experiment_id, inquiry);
+      setResult(await getBranchExperiment(result.experiment_id));
+    } catch (err) {
+      const payload = err as { error?: string };
+      setError(payload.error ?? "创建研究决定失败");
+    } finally {
+      setLoadingId("");
+    }
+  }
+
+  async function continueAdaptive(inquiryId: string) {
+    if (!result || busy) return;
+    setLoadingId(inquiryId);
+    setError("");
+    try {
+      setResult(await runAdaptiveBatch(result.experiment_id, inquiryId));
+    } catch (err) {
+      const payload = err as { error?: string };
+      setError(payload.error ?? "自适应追加失败");
+    } finally {
+      setLoadingId("");
+    }
+  }
+
   return (
     <section className="panel">
       <h2>中途测量后的条件分支实验</h2>
@@ -223,7 +265,17 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
             </button>
           </div>
           {error && <div className="error-box">{error}</div>}
-          {result && <ExperimentResult result={result} branches={branches} busy={busy} loadingId={loadingId} onContinue={continueBranch} />}
+          {result && (
+            <ExperimentResult
+              result={result}
+              branches={branches}
+              busy={busy}
+              loadingId={loadingId}
+              onContinue={continueBranch}
+              onAddInquiry={addInquiry}
+              onAdaptiveBatch={continueAdaptive}
+            />
+          )}
         </>
       )}
     </section>
@@ -316,12 +368,23 @@ function ExperimentResult({
   busy,
   loadingId,
   onContinue,
+  onAddInquiry,
+  onAdaptiveBatch,
 }: {
   result: BranchExperiment;
   branches: BranchDraft[];
   busy: boolean;
   loadingId: string;
   onContinue: (branchId: string, shots: number) => void;
+  onAddInquiry: (inquiry: {
+    mode: "single" | "compare";
+    branch_ids: string[];
+    event: string;
+    margin: number;
+    total_budget: number;
+    batch_size: number;
+  }) => void;
+  onAdaptiveBatch: (inquiryId: string) => void;
 }) {
   return (
     <div className="branch-results">
@@ -364,6 +427,104 @@ function ExperimentResult({
           </div>
         );
       })}
+      <InquiryPanel result={result} busy={busy} loadingId={loadingId} onAddInquiry={onAddInquiry} onAdaptiveBatch={onAdaptiveBatch} />
+    </div>
+  );
+}
+
+function InquiryPanel({
+  result,
+  busy,
+  loadingId,
+  onAddInquiry,
+  onAdaptiveBatch,
+}: {
+  result: BranchExperiment;
+  busy: boolean;
+  loadingId: string;
+  onAddInquiry: Parameters<typeof ExperimentResult>[0]["onAddInquiry"];
+  onAdaptiveBatch: (inquiryId: string) => void;
+}) {
+  const [mode, setMode] = useState<"single" | "compare">("single");
+  const [branchA, setBranchA] = useState(result.branches[0]?.branch_id ?? "");
+  const [branchB, setBranchB] = useState(result.branches[1]?.branch_id ?? "");
+  const [event, setEvent] = useState("__pass__");
+  const [margin, setMargin] = useState(0.05);
+  const [totalBudget, setTotalBudget] = useState(1000);
+  const [batchSize, setBatchSize] = useState(25);
+
+  return (
+    <div className="inquiry-panel">
+      <h3>序贯研究决定</h3>
+      <p className="muted">
+        使用每次查看后仍成立的置信序列；系统按当前证据宽度选择下一批分支。预算耗尽仍不能区分时保持“未确定”。
+      </p>
+      <div className="inline-controls">
+        <select value={mode} onChange={(item) => setMode(item.target.value as "single" | "compare")}>
+          <option value="single">观察一个分支</option>
+          <option value="compare">比较两个分支</option>
+        </select>
+        <select value={branchA} onChange={(item) => setBranchA(item.target.value)}>
+          {result.branches.map((branch) => <option key={branch.branch_id} value={branch.branch_id}>{branch.label}</option>)}
+        </select>
+        {mode === "compare" && (
+          <select value={branchB} onChange={(item) => setBranchB(item.target.value)}>
+            {result.branches.map((branch) => <option key={branch.branch_id} value={branch.branch_id}>{branch.label}</option>)}
+          </select>
+        )}
+        <select value={event} onChange={(item) => setEvent(item.target.value)}>
+          <option value="__pass__">筛选接受率</option>
+          {Object.keys(result.branches[0]?.counts ?? {}).map((outcome) => (
+            <option key={outcome} value={outcome}>事件 |{outcome}⟩</option>
+          ))}
+        </select>
+      </div>
+      <div className="inline-controls">
+        <label>允许误差 <input type="number" min={0.0001} max={0.9999} step={0.001} value={margin} onChange={(item) => setMargin(Number(item.target.value))} /></label>
+        <label>总尝试上限 <input type="number" min={1} value={totalBudget} onChange={(item) => setTotalBudget(Number(item.target.value))} /></label>
+        <label>批量 <input type="number" min={1} value={batchSize} onChange={(item) => setBatchSize(Number(item.target.value))} /></label>
+        <button
+          type="button"
+          disabled={busy || (mode === "compare" && (!branchA || !branchB || branchA === branchB))}
+          onClick={() => onAddInquiry({
+            mode,
+            branch_ids: mode === "single" ? [branchA] : [branchA, branchB],
+            event,
+            margin,
+            total_budget: totalBudget,
+            batch_size: batchSize,
+          })}
+        >
+          {loadingId === "inquiry-create" ? "创建中…" : "创建研究决定"}
+        </button>
+      </div>
+      {result.inquiries.map((inquiry) => (
+        <div key={inquiry.inquiry_id} className="branch-result">
+          <strong>{inquiry.mode === "single" ? "单分支观察" : "双分支比较"} · {inquiry.status}</strong>
+          <p className="muted">
+            事件 {inquiry.event}；允许误差 ±{inquiry.margin}；已用 {inquiry.current_evaluation.used_budget}/
+            {inquiry.total_budget}；批量 {inquiry.batch_size}。
+          </p>
+          {inquiry.current_evaluation.conclusion && <div className="notice-box">{inquiry.current_evaluation.conclusion.message}</div>}
+          {inquiry.current_evaluation.branch_statistics.map((stat) => (
+            <p key={stat.branch_id} className="muted">
+              {stat.label}：{stat.event_successes}/{stat.event_trials}，区间 [{stat.event_interval[0].toFixed(3)}, {stat.event_interval[1].toFixed(3)}]，
+              证据宽度 {stat.event_width.toFixed(3)}，分配分数 {stat.allocation_score.toFixed(3)}。{stat.evidence_note}
+            </p>
+          ))}
+          <button type="button" disabled={busy || inquiry.status !== "active"} onClick={() => onAdaptiveBatch(inquiry.inquiry_id)}>
+            {loadingId === inquiry.inquiry_id ? "追加中…" : "按最缺证据继续一批"}
+          </button>
+          <details>
+            <summary>停止规则与预算分配审计（{inquiry.decisions.length}）</summary>
+            <ol className="decision-log">
+              {inquiry.decisions.map((decision) => (
+                <li key={decision.decision_id}>{decision.action}：{decision.reason}（{decision.shots} 次）</li>
+              ))}
+            </ol>
+          </details>
+        </div>
+      ))}
     </div>
   );
 }

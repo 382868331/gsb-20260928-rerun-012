@@ -99,6 +99,63 @@ export interface BranchExperimentResult {
   counts: Record<string, number>;
   frequencies: Record<string, number> | null;
   batches: Array<{ batch_id: string; source: string; shots: number; total_shots_after_batch: number }>;
+  pass_interval?: [number, number] | null;
+  event_interval?: [number, number];
+  event_width?: number;
+  allocation_score?: number;
+}
+
+export interface InquiryDecision {
+  decision_id: string;
+  at: number;
+  action: "created" | "sample" | "stop";
+  branch_id: string | null;
+  shots: number;
+  reason: string;
+  batch_id: string | null;
+  before_statistics?: BranchInquiryStat[];
+  evaluation_after?: InquiryEvaluation;
+}
+
+export interface BranchInquiryStat {
+  branch_id: string;
+  label: string;
+  attempts: number;
+  passed_shots: number | null;
+  event: string;
+  event_successes: number;
+  event_trials: number;
+  event_interval: [number, number];
+  event_width: number;
+  pass_interval: [number, number] | null;
+  allocation_score: number;
+  evidence_note: string;
+  difference_interval?: [number, number];
+}
+
+export interface InquiryEvaluation {
+  status: "continue" | "decided" | "inconclusive_budget_exhausted";
+  remaining_budget: number;
+  used_budget: number;
+  branch_statistics: BranchInquiryStat[];
+  conclusion: { type: string; message: string } | null;
+}
+
+export interface BranchInquiry {
+  inquiry_id: string;
+  revision: number;
+  created_at: number;
+  mode: "single" | "compare";
+  branch_ids: [string] | [string, string];
+  event: string;
+  margin: number;
+  total_budget: number;
+  batch_size: number;
+  alpha: number;
+  immutable: boolean;
+  status: "active" | "decided" | "inconclusive_budget_exhausted";
+  current_evaluation: InquiryEvaluation;
+  decisions: InquiryDecision[];
 }
 
 export interface BranchExperiment {
@@ -118,6 +175,7 @@ export interface BranchExperiment {
     prefix_measurements: Array<{ step: number; target: number; outcome: number }>;
   };
   branches: BranchExperimentResult[];
+  inquiries: BranchInquiry[];
 }
 
 export interface ExperimentResult {

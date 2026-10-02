@@ -2,6 +2,7 @@ import type {
   BranchComparison,
   BranchExperiment,
   BranchExperimentSpec,
+  BranchInquiry,
   CheckpointState,
   CircuitStep,
   Circuit,
@@ -90,6 +91,29 @@ export function addBranchShots(
 
 export function getBranchExperiment(experimentId: string) {
   return request<BranchExperiment>(`/api/branch-experiments/${encodeURIComponent(experimentId)}`, "GET");
+}
+
+export function createBranchInquiry(experimentId: string, inquiry: {
+  mode: "single" | "compare";
+  branch_ids: string[];
+  event: string;
+  margin: number;
+  total_budget: number;
+  batch_size: number;
+}) {
+  return request<BranchInquiry>(
+    `/api/branch-experiments/${encodeURIComponent(experimentId)}/inquiries`,
+    "PATCH",
+    { inquiry },
+  );
+}
+
+export function runAdaptiveBatch(experimentId: string, inquiryId: string, batchSize?: number) {
+  return request<{ evaluation: BranchInquiry["current_evaluation"] } & BranchExperiment>(
+    `/api/branch-experiments/${encodeURIComponent(experimentId)}/inquiries/${encodeURIComponent(inquiryId)}/adaptive-batch`,
+    "PATCH",
+    batchSize === undefined ? {} : { batch_size: batchSize },
+  );
 }
 
 function stripIds(steps: CircuitStep[]) {

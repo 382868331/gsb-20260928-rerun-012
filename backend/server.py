@@ -566,6 +566,11 @@ class Handler(BaseHTTPRequestHandler):
                     name = payload.get("name", "conditional-branches")
                     if not isinstance(name, str) or not name.strip():
                         raise ValueError("name must be a non-empty string")
+                    raw_inquiries = payload.get("inquiries", [])
+                    if raw_inquiries is None:
+                        raw_inquiries = []
+                    if not isinstance(raw_inquiries, list):
+                        raise ValueError("inquiries must be a list")
                     for spec in specs:
                         if not 0 <= int(spec["budget"]) <= 100_000:
                             raise ValueError("each branch budget must be in [0, 100000]")
@@ -579,6 +584,7 @@ class Handler(BaseHTTPRequestHandler):
                         storage_dir=storage_dir,
                         base_seed=seed,
                         name=name.strip(),
+                        inquiries=raw_inquiries,
                     )
                 except ValueError as exc:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -669,19 +675,19 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             parts = self.path.strip("/").split("/")
-            expected = ["api", "branch-experiments", None, "branches", None, "shots"]
-            if len(parts) != len(expected) or any(value is not None and item != value for item, value in zip(parts, expected)):
+            expected_shot = ["api", "branch-experiments", None, "branches", None, "shots"]
+            expected_inquiry = ["api", "branch-experiments", None, "inquiries", None, "adaptive-batch"]
+            expected_inquiries = ["api", "branch-experiments", None, "inquiries"]
+            if len(parts) == len(expected_shot) and all(value is None or item == value for item, value in zip(parts, expected_shot)):
+                route = "shots"
+            elif len(parts) == len(expected_inquiry) and all(value is None or item == value for item, value in zip(parts, expected_inquiry)):
+                route = "adaptive-batch"
+            elif len(parts) == len(expected_inquiries) and all(value is None or item == value for item, value in zip(parts, expected_inquiries)):
+                route = "inquiries"
+            else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
-            experiment_id, branch_id = parts[2], parts[4]
-            shots = payload.get("shots")
-            if not isinstance(shots, int) or isinstance(shots, bool) or not 1 <= shots <= 100_000:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "shots must be an integer in [1, 100000]"})
-                return
-            source = payload.get("source", "continued")
-            if not isinstance(source, str) or not source.strip():
-                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "source must be a non-empty string"})
-                return
+            experiment_id = parts[2]
             try:
                 storage_dir = _branch_storage_dir(payload)
                 experiment = _load_branch_experiment(experiment_id, storage_dir)
@@ -693,14 +699,36 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 with SESSIONS_LOCK:
-                    batch = experiment.add_shots(branch_id, shots, source=source.strip())
+                    if route == "shots":
+                        branch_id = parts[4]
+                        shots = payload.get("shots")
+                        if not isinstance(shots, int) or isinstance(shots, bool) or not 1 <= shots <= 100_000:
+                            raise ValueError("shots must be an integer in [1, 100000]")
+                        source = payload.get("source", "continued")
+                        if not isinstance(source, str) or not source.strip():
+                            raise ValueError("source must be a non-empty string")
+                        experiment.add_shots(branch_id, shots, source=source.strip())
+                        response = experiment.snapshot()
+                    elif route == "inquiries":
+                        response = experiment.add_inquiry(payload.get("inquiry", payload))
+                    else:
+                        inquiry_id = parts[4]
+                        batch_size = payload.get("batch_size")
+                        if batch_size is not None and (
+                            not isinstance(batch_size, int)
+                            or isinstance(batch_size, bool)
+                            or batch_size <= 0
+                        ):
+                            raise ValueError("batch_size must be a positive integer")
+                        evaluation = experiment.run_adaptive_batch(inquiry_id, batch_size=batch_size)
+                        response = {"evaluation": evaluation, **experiment.snapshot()}
             except KeyError as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
                 return
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
-            self._send_json(HTTPStatus.OK, {"batch": batch, **experiment.snapshot()})
+            self._send_json(HTTPStatus.OK, response)
         except Exception as exc:
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"server error: {exc}"})
 
