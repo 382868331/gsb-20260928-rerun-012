@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from . import adaptive
 from . import branches as branch_store
 from . import quantum
 
@@ -26,6 +27,7 @@ PORT = 8000
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CIRCUITS_FILE = DATA_DIR / "circuits.json"
 BRANCH_DIR = DATA_DIR / "branch-experiments"
+STUDY_DIR = DATA_DIR / "adaptive-studies"
 
 
 def _load_circuits() -> dict[str, Any]:
@@ -317,6 +319,15 @@ def _load_branch_experiment(experiment_id: str, storage_dir: str | Path | None =
 BRANCH_EXPERIMENTS: dict[str, branch_store.BranchExperiment] = {}
 
 
+def _load_study(study_id: str, storage_dir: str | Path | None = None) -> adaptive.AdaptiveStudy:
+    directory = Path(storage_dir) if storage_dir is not None else STUDY_DIR
+    return adaptive.AdaptiveStudy.load(directory / f"{study_id}.json")
+
+
+def _study_experiment(study: adaptive.AdaptiveStudy) -> branch_store.BranchExperiment:
+    return _load_branch_experiment(study.experiment_id, Path(study.experiment_storage_dir))
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "QuantumBench/0.1"
 
@@ -390,6 +401,29 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "branch experiment not found"})
                     return
                 self._send_json(HTTPStatus.OK, experiment.snapshot())
+                return
+
+            if path.startswith("/api/studies/"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 3:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                    return
+                study_id = parts[2]
+                if not study_id.replace("-", "").isalnum():
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid study id"})
+                    return
+                raw_location = parse_qs(parsed.query).get("storage_dir", [""])[0]
+                study_dir = Path(raw_location).expanduser() if raw_location else None
+                if study_dir is not None and not study_dir.is_absolute():
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "storage_dir must be an absolute path"})
+                    return
+                try:
+                    study = _load_study(study_id, study_dir)
+                    experiment = _study_experiment(study)
+                except (OSError, KeyError, json.JSONDecodeError):
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "study not found"})
+                    return
+                self._send_json(HTTPStatus.OK, study.snapshot(experiment))
                 return
 
             if path.startswith("/api/circuits/"):
@@ -587,6 +621,67 @@ class Handler(BaseHTTPRequestHandler):
                     with SESSIONS_LOCK:
                         BRANCH_EXPERIMENTS[experiment.experiment_id] = experiment
                 self._send_json(HTTPStatus.CREATED, experiment.snapshot())
+                return
+
+            if path.startswith("/api/branch-experiments/") and path.endswith("/studies"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                    return
+                experiment_id = parts[2]
+                try:
+                    storage_dir = _branch_storage_dir(payload)
+                    experiment = _load_branch_experiment(experiment_id, storage_dir)
+                    study_storage = payload.get("study_storage_dir")
+                    if study_storage is not None:
+                        if not isinstance(study_storage, str) or not Path(study_storage).is_absolute():
+                            raise ValueError("study_storage_dir must be an absolute path string")
+                        study_dir = Path(study_storage)
+                    else:
+                        study_dir = STUDY_DIR
+                    name = payload.get("name")
+                    if name is not None and not isinstance(name, str):
+                        raise ValueError("name must be a string")
+                    study = adaptive.AdaptiveStudy.create(
+                        experiment, payload, storage_dir=study_dir, name=name
+                    )
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                except (OSError, KeyError, json.JSONDecodeError):
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "branch experiment not found"})
+                    return
+                self._send_json(HTTPStatus.CREATED, study.snapshot(experiment))
+                return
+
+            if path.startswith("/api/studies/") and (
+                path.endswith("/advance") or path.endswith("/run")
+            ):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                    return
+                study_id, action = parts[2], parts[3]
+                try:
+                    raw_dir = payload.get("storage_dir")
+                    if raw_dir is not None and (
+                        not isinstance(raw_dir, str) or not Path(raw_dir).is_absolute()
+                    ):
+                        raise ValueError("storage_dir must be an absolute path string")
+                    study = _load_study(study_id, raw_dir)
+                    experiment = _study_experiment(study)
+                except ValueError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                except (OSError, KeyError, json.JSONDecodeError):
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "study not found"})
+                    return
+                with SESSIONS_LOCK:
+                    if action == "run":
+                        study.run(experiment)
+                    else:
+                        study.advance(experiment)
+                self._send_json(HTTPStatus.OK, study.snapshot(experiment))
                 return
 
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
