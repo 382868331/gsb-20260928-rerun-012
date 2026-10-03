@@ -135,6 +135,7 @@ export interface BranchInquiryStat {
 
 export interface InquiryEvaluation {
   status: "continue" | "decided" | "inconclusive_budget_exhausted";
+  cs_rule_version?: string;
   remaining_budget: number;
   used_budget: number;
   branch_statistics: BranchInquiryStat[];
@@ -152,10 +153,12 @@ export interface BranchInquiry {
   total_budget: number;
   batch_size: number;
   alpha: number;
+  cs_rule_version?: string;
+  cs_rule_note?: string;
   immutable: boolean;
   status: "active" | "decided" | "inconclusive_budget_exhausted";
   current_evaluation: InquiryEvaluation;
-  decisions: InquiryDecision[];
+  decisions: Array<InquiryDecision & { cs_rule_version?: string }>;
 }
 
 export interface BranchExperiment {

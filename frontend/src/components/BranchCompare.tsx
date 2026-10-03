@@ -505,11 +505,17 @@ function InquiryPanel({
             事件 {inquiry.event}；允许误差 ±{inquiry.margin}；已用 {inquiry.current_evaluation.used_budget}/
             {inquiry.total_budget}；批量 {inquiry.batch_size}。
           </p>
+          <p className="muted">
+            区间规则：{inquiry.current_evaluation.cs_rule_version ?? inquiry.cs_rule_version ?? "未知版本"}
+            {inquiry.cs_rule_note ? `（${inquiry.cs_rule_note}）` : ""}
+          </p>
           {inquiry.current_evaluation.conclusion && <div className="notice-box">{inquiry.current_evaluation.conclusion.message}</div>}
           {inquiry.current_evaluation.branch_statistics.map((stat) => (
             <p key={stat.branch_id} className="muted">
               {stat.label}：{stat.event_successes}/{stat.event_trials}，区间 [{stat.event_interval[0].toFixed(3)}, {stat.event_interval[1].toFixed(3)}]，
-              证据宽度 {stat.event_width.toFixed(3)}，分配分数 {stat.allocation_score.toFixed(3)}。{stat.evidence_note}
+              证据宽度 {stat.event_width.toFixed(3)}，分配分数 {stat.allocation_score.toFixed(3)}。
+              {stat.pass_interval ? `接受率区间 [${stat.pass_interval[0].toFixed(3)}, ${stat.pass_interval[1].toFixed(3)}]；` : ""}
+              {stat.evidence_note}
             </p>
           ))}
           <button type="button" disabled={busy || inquiry.status !== "active"} onClick={() => onAdaptiveBatch(inquiry.inquiry_id)}>

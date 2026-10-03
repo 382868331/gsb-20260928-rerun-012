@@ -94,6 +94,20 @@ def _passes_filters(filters: list[dict[str, int]], measurements: list[dict[str, 
 
 PASS_EVENT = "__pass__"
 
+# Confidence-sequence rule version embedded in every new inquiry and
+# evaluation. v2 fixes the reversed upper-root bisection (and the unsafe
+# fixed 1e-12 bracket) that made upper endpoints collapse onto the MLE,
+# e.g. 80/100 returned upper bound 0.80 instead of ~0.89.
+CS_RULE_VERSION = "beta-mixture-cs-v2"
+# Historical records produced before the bisection fix are tagged with this
+# rule name when loaded from disk; stored counts/decisions stay untouched.
+LEGACY_CS_RULE_VERSION = "beta-mixture-cs-v1-buggy-upper-root"
+CS_RULE_NOTE = (
+    "规则 beta-mixture-cs-v2：Beta(1,1) 混合似然置信序列，"
+    "修正了 v1 上界二分方向反转导致上界坍缩到点估计的缺陷；"
+    "边界 0/1 用从 MLE 指数扩展的括号求根，零命中与全命中均保持有限证据区间"
+)
+
 
 def beta_mixture_interval(successes: int, trials: int, alpha: float) -> tuple[float, float]:
     """Beta(1,1)-mixture confidence sequence for a Bernoulli probability.
@@ -123,17 +137,36 @@ def beta_mixture_interval(successes: int, trials: int, alpha: float) -> tuple[fl
             return float("-inf")
         return successes * math.log(probability) + (trials - successes) * math.log(1.0 - probability)
 
-    def root(left: float, right: float) -> float:
-        for _ in range(60):
-            middle = (left + right) / 2.0
-            if log_likelihood(middle) >= threshold:
-                right = middle
-            else:
-                left = middle
-        return (left + right) / 2.0
+    mle = successes / trials
 
-    lower = 0.0 if successes == 0 else root(1e-12, successes / trials)
-    upper = 1.0 if successes == trials else root(successes / trials, 1.0 - 1e-12)
+    def accepted(probability: float) -> bool:
+        return log_likelihood(probability) >= threshold
+
+    def root(inside: float, direction: int) -> float:
+        # Expand exponentially from the MLE until the bracket crosses the
+        # boundary; this stays valid for rare events and very large samples
+        # where a fixed epsilon (e.g. 1e-12) would itself be inside the set.
+        step = max(mle, 1.0 - mle, 1e-300)
+        candidate = inside
+        for _ in range(2000):
+            trial = candidate + direction * step
+            if trial <= 0.0 or trial >= 1.0 or not accepted(trial):
+                break
+            candidate = trial
+            step *= 2.0
+        inside_pt, outside_pt = inside, max(0.0, min(1.0, trial))
+        # Bisection keeps one endpoint strictly inside the acceptance set
+        # and the other outside, regardless of which side the boundary is on.
+        for _ in range(80):
+            middle = (inside_pt + outside_pt) / 2.0
+            if accepted(middle):
+                inside_pt = middle
+            else:
+                outside_pt = middle
+        return max(0.0, min(1.0, (inside_pt + outside_pt) / 2.0))
+
+    lower = 0.0 if successes == 0 else root(mle, -1)
+    upper = 1.0 if successes == trials else root(mle, 1)
     return max(0.0, lower), min(1.0, upper)
 
 
@@ -440,6 +473,7 @@ class BranchExperiment:
 
         return {
             "status": status,
+            "cs_rule_version": CS_RULE_VERSION,
             "remaining_budget": max(0, total_budget - used),
             "used_budget": used,
             "branch_statistics": stats,
@@ -509,6 +543,8 @@ class BranchExperiment:
             "total_budget": int(total_budget),
             "batch_size": int(batch_size),
             "alpha": float(alpha),
+            "cs_rule_version": CS_RULE_VERSION,
+            "cs_rule_note": CS_RULE_NOTE,
             "immutable": True,
             "status": "active",
             "decisions": [],
@@ -535,6 +571,21 @@ class BranchExperiment:
         inquiry = self.inquiries[inquiry_id]
         if inquiry["status"] != "active":
             raise ValueError("this inquiry has already stopped")
+        if inquiry.get("cs_rule_version") == LEGACY_CS_RULE_VERSION:
+            # First continuation after the fix: switch the *future* stopping
+            # rule to v2, but never rewrite historical counts or evaluations.
+            inquiry["cs_rule_version"] = CS_RULE_VERSION
+            self._record_inquiry_decision(
+                inquiry,
+                action="rule_migrated",
+                branch_id=None,
+                shots=0,
+                reason=(
+                    "该研究创建于修正前（v1，上界可能坍缩到点估计）；"
+                    "原始批次、计数与历史评估保持只读不变。"
+                    "自本次继续起，停止与区间判断改用 " + CS_RULE_NOTE
+                ),
+            )
         used = self._inquiry_used_budget(inquiry)
         before = self._evaluate_inquiry(inquiry)
         if before["status"] != "continue":
@@ -686,6 +737,17 @@ class BranchExperiment:
             branch.setdefault("filters", [])
             branch.setdefault("passed_shots", int(branch.get("completed_shots", 0)))
         inquiries = data.get("inquiries", {})
+        for inquiry in inquiries.values():
+            # Records created before the bisection fix have no rule tag.
+            # Keep their stored counts and decision evaluations untouched;
+            # only annotate which rule produced them so history stays honest.
+            inquiry.setdefault("cs_rule_version", LEGACY_CS_RULE_VERSION)
+            inquiry.setdefault(
+                "cs_rule_note",
+                "历史记录：采用修正前的 beta-mixture-cs-v1 规则计算；"
+                "该规则上界二分方向反转，上界会坍缩到点估计（如 80/100 上界=0.8）。"
+                "原始事件、计数与当时评估保持不变；继续追加样本时改用 v2 并另行记录",
+            )
         return cls(
             experiment_id=data["experiment_id"],
             name=data["name"],

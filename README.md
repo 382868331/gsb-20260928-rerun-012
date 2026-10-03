@@ -45,6 +45,7 @@ npm run dev
 - 自适应继续不会给各分支固定追加同样数量，而是在每次查看后计算适用于反复查看/自适应分配的 Beta 混合置信序列，并把下一批分给当前证据区间最宽（含筛选接受率不确定性）的分支。
 - 每次继续都会记录采样前证据、被选分支、批量、采样后停止判断和原因；预算用完但概率差仍不能排除时，结论保持“未确定”，不会换成固定样本量口径宣布赢家。
 - 修改 margin、关心事件或比较对象会创建新的研究决定（revision 1 的新 inquiry），旧决定、旧批次和原始停止说明继续只读保存。
+- 每个研究决定与其评估都带置信序列规则版本（当前 `beta-mixture-cs-v2`）。v2 修正了 v1 上界二分方向反转、导致上界坍缩到点估计的缺陷（例如 80/100 时上界错误地只有 0.8；正确上界约 0.907，候选概率 0.85 应在区间内）。磁盘上的 v1 历史记录加载后标记为 `beta-mixture-cs-v1-buggy-upper-root`，原始事件、计数与当时评估保持不变；首次继续追加时记录 `rule_migrated`，此后的停止判断改用 v2。
 - 分支基础随机种子由实验保存，分支 RNG 由“基础种子 + 分支 ID”确定性派生。因此改变分支运行顺序、先追加哪个方案，或把同一个实验 JSON 复制到另一个保存位置，恢复后追加样本都得到相同的可重放序列。
 - 旧的单次轨迹比较仍可通过 `/api/checkpoints/<checkpoint_id>/compare` 调试单条轨迹；统计判断使用条件分支实验接口 `/api/checkpoints/<checkpoint_id>/branch-experiments`。
 - 研究决定接口：PATCH /api/branch-experiments/experiment-id/inquiries 创建决定；PATCH /api/branch-experiments/experiment-id/inquiries/inquiry-id/adaptive-batch 执行下一批，可用 batch_size 临时指定本次批量。
