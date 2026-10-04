@@ -94,6 +94,18 @@ def _passes_filters(filters: list[dict[str, int]], measurements: list[dict[str, 
 
 PASS_EVENT = "__pass__"
 
+RULE_VERSION = "beta-mixture-cs-v2"
+RULE_DESCRIPTION = (
+    "Beta(1,1) 混合置信序列（v2 修正版）：上界按似然阈值在 MLE 右侧求根，"
+    "支持反复查看与自适应分配；全成功/全失败时对应一侧退到 0 或 1"
+)
+LEGACY_RULE_VERSION = "beta-mixture-cs-v1"
+LEGACY_RULE_DESCRIPTION = (
+    "Beta(1,1) 混合置信序列（v1 旧版）：上界二分方向错误，80/100 等数据的上界被算成 MLE，"
+    "区间过窄；仅用于标注修正前的历史研究，不再用于新决定"
+)
+_BISECTION_ENDPOINT = 1e-300
+
 
 def beta_mixture_interval(successes: int, trials: int, alpha: float) -> tuple[float, float]:
     """Beta(1,1)-mixture confidence sequence for a Bernoulli probability.
@@ -123,7 +135,8 @@ def beta_mixture_interval(successes: int, trials: int, alpha: float) -> tuple[fl
             return float("-inf")
         return successes * math.log(probability) + (trials - successes) * math.log(1.0 - probability)
 
-    def root(left: float, right: float) -> float:
+    def root_below_mle(left: float, right: float) -> float:
+        # On (0, MLE] likelihood increases with p.
         for _ in range(60):
             middle = (left + right) / 2.0
             if log_likelihood(middle) >= threshold:
@@ -132,8 +145,19 @@ def beta_mixture_interval(successes: int, trials: int, alpha: float) -> tuple[fl
                 left = middle
         return (left + right) / 2.0
 
-    lower = 0.0 if successes == 0 else root(1e-12, successes / trials)
-    upper = 1.0 if successes == trials else root(successes / trials, 1.0 - 1e-12)
+    def root_above_mle(left: float, right: float) -> float:
+        # On [MLE, 1) likelihood decreases with p.
+        for _ in range(60):
+            middle = (left + right) / 2.0
+            if log_likelihood(middle) >= threshold:
+                left = middle
+            else:
+                right = middle
+        return (left + right) / 2.0
+
+    mle = successes / trials
+    lower = 0.0 if successes == 0 else root_below_mle(_BISECTION_ENDPOINT, mle)
+    upper = 1.0 if successes == trials else root_above_mle(mle, 1.0 - _BISECTION_ENDPOINT)
     return max(0.0, lower), min(1.0, upper)
 
 
@@ -345,7 +369,10 @@ class BranchExperiment:
         if filtered and event != PASS_EVENT:
             score += _uncertainty_width(pass_interval or (0.0, 1.0))
         if filtered and event != PASS_EVENT and passed == 0:
-            evidence_note = "筛选尚未命中；接受率和接受后分布均缺少证据"
+            evidence_note = (
+                f"筛选零命中：接受率本身有 {shots} 次尝试的证据，区间 {pass_interval}；"
+                "接受后事件有效样本数为 0，条件分布没有证据，区间保持 [0,1]"
+            )
         elif filtered:
             evidence_note = f"筛选命中 {passed}/{shots}；接受率与目标事件分开估计"
         else:
@@ -371,6 +398,10 @@ class BranchExperiment:
             for entry in inquiry.get("decisions", [])
             if entry.get("action") == "sample"
         )
+
+    @staticmethod
+    def _inquiry_rule_version(inquiry: dict[str, Any]) -> str:
+        return str(inquiry.get("rule_version") or LEGACY_RULE_VERSION)
 
     def _evaluate_inquiry(self, inquiry: dict[str, Any]) -> dict[str, Any]:
         alpha = float(inquiry["alpha"])
@@ -440,6 +471,8 @@ class BranchExperiment:
 
         return {
             "status": status,
+            "rule_version": RULE_VERSION,
+            "rule_description": RULE_DESCRIPTION,
             "remaining_budget": max(0, total_budget - used),
             "used_budget": used,
             "branch_statistics": stats,
@@ -462,6 +495,8 @@ class BranchExperiment:
             "decision_id": uuid.uuid4().hex,
             "at": time.time(),
             "action": action,
+            "rule_version": RULE_VERSION,
+            "rule_description": RULE_DESCRIPTION,
             "branch_id": branch_id,
             "shots": int(shots),
             "reason": reason,
@@ -502,6 +537,8 @@ class BranchExperiment:
             "inquiry_id": uuid.uuid4().hex,
             "revision": 1,
             "created_at": time.time(),
+            "rule_version": RULE_VERSION,
+            "rule_description": RULE_DESCRIPTION,
             "mode": mode,
             "branch_ids": list(selected),
             "event": event,
@@ -550,6 +587,20 @@ class BranchExperiment:
         if requested <= 0:
             raise ValueError("batch_size must be positive")
         shots = min(requested, int(inquiry["total_budget"]) - used)
+        if self._inquiry_rule_version(inquiry) == LEGACY_RULE_VERSION:
+            self._record_inquiry_decision(
+                inquiry,
+                action="created",
+                branch_id=None,
+                shots=0,
+                reason=(
+                    "规则修正留痕：该决定原按 v1（上界错误、区间过窄）规则执行；"
+                    "自本批起改用 v2 修正规则，此前计数、批次与决策日志原样保留"
+                ),
+                before_statistics=None,
+            )
+            inquiry["rule_version"] = RULE_VERSION
+            inquiry["rule_description"] = RULE_DESCRIPTION
         batch = self._sample(
             self.branches[chosen["branch_id"]],
             shots,
@@ -587,10 +638,36 @@ class BranchExperiment:
     def inquiry_snapshot(self, inquiry_id: str) -> dict[str, Any]:
         inquiry = self.inquiries[inquiry_id]
         evaluation = self._evaluate_inquiry(inquiry)
+        stored_rule_version = self._inquiry_rule_version(inquiry)
+        legacy = stored_rule_version == LEGACY_RULE_VERSION
+        rule_note = (
+            "该研究决定创建于规则修正前（v1，上界等于 MLE、区间过窄）；原始计数、批次与决策日志均不改动，"
+            "当前重新计算仅作 v2 对照，不覆盖该决定既有的停止状态与原因。"
+            if legacy and inquiry["status"] != "active"
+            else (
+                "该研究决定创建于规则修正前（v1）；尚未停止，此后追加样本与停止判断改用 v2 修正规则，"
+                "原始计数与批次不变，规则切换在决策日志中留痕。"
+                if legacy
+                else None
+            )
+        )
+        decisions = []
+        for entry in inquiry.get("decisions", []):
+            annotated = dict(entry)
+            version = annotated.get("rule_version")
+            if version is None:
+                annotated["rule_version"] = LEGACY_RULE_VERSION
+                annotated["rule_description"] = LEGACY_RULE_DESCRIPTION
+            decisions.append(annotated)
         return {
             **{key: value for key, value in inquiry.items() if key != "decisions"},
+            "rule_version": stored_rule_version,
+            "rule_description": (
+                LEGACY_RULE_DESCRIPTION if legacy else inquiry.get("rule_description", RULE_DESCRIPTION)
+            ),
+            "rule_note": rule_note,
             "current_evaluation": evaluation,
-            "decisions": list(inquiry.get("decisions", [])),
+            "decisions": decisions,
         }
 
     def save(self) -> Path:

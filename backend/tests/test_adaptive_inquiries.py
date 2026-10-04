@@ -100,7 +100,8 @@ def test_rare_filter_allocates_to_branch_without_conditional_evidence(tmp_path):
     assert rare_stats["pass_interval"][1] > 0
     assert rare_stats["event_trials"] == 0
     assert rare_stats["event_interval"] == [0.0, 1.0]
-    assert "接受率和接受后分布均缺少证据" in final_inquiry["decisions"][-2]["reason"]
+    assert "接受率本身有" in final_inquiry["decisions"][-2]["reason"]
+    assert "条件分布没有证据" in final_inquiry["decisions"][-2]["reason"]
 
 
 def test_changing_target_creates_new_immutable_inquiry_and_keeps_history(tmp_path):
@@ -132,6 +133,7 @@ def test_different_batch_sizes_reach_same_certain_conclusion(tmp_path):
     checkpoint = _checkpoint()
     specs = [{"branch_id": "only", "label": "only", "steps": [], "budget": 0}]
     outcomes = []
+    evidence_paths = {}
     for batch_size in (1, 10):
         experiment = branches.BranchExperiment.create(
             checkpoint,
@@ -145,9 +147,14 @@ def test_different_batch_sizes_reach_same_certain_conclusion(tmp_path):
              "margin": 0.05, "total_budget": 1000, "batch_size": batch_size}
         )
         inquiry_id = inquiry["inquiry_id"]
+        path = []
         while experiment.inquiry_snapshot(inquiry_id)["status"] == "active":
             experiment.run_adaptive_batch(inquiry_id)
+            evaluation = experiment.inquiry_snapshot(inquiry_id)["current_evaluation"]
+            lower, upper = evaluation["branch_statistics"][0]["event_interval"]
+            path.append((evaluation["used_budget"], lower, upper, upper - lower))
         final = experiment.inquiry_snapshot(inquiry_id)
+        evidence_paths[batch_size] = path
         outcomes.append((
             final["status"],
             final["current_evaluation"]["conclusion"]["type"],
@@ -157,3 +164,26 @@ def test_different_batch_sizes_reach_same_certain_conclusion(tmp_path):
     assert outcomes[0][0] == outcomes[1][0] == "decided"
     assert outcomes[0][1] == outcomes[1][1] == "probability_estimated"
     assert outcomes[0][2] == outcomes[1][2]
+    # Compare evidence/interval trajectories, not only a point estimate:
+    # both schedules see the same RNG stream, so at common cumulative counts
+    # their intervals must match exactly; each stops the first time the
+    # width rule is satisfied (batch granularity changes the check point).
+    fine = evidence_paths[1]
+    coarse = evidence_paths[10]
+    fine_at = {used: (lower, upper, width) for used, lower, upper, width in fine}
+    coarse_at = {used: (lower, upper, width) for used, lower, upper, width in coarse}
+    common = sorted(set(fine_at) & set(coarse_at))
+    assert common
+    for used in common:
+        assert fine_at[used] == coarse_at[used]
+    assert fine[-1][0] <= coarse[-1][0]
+    assert all(lower <= 1.0 <= upper for _, lower, upper, _ in fine + coarse)
+    settled = next(index for index, (_, _, _, width) in enumerate(fine) if width < 1.0)
+    settled_widths = [width for *_, width in fine[settled:]]
+    assert settled_widths == sorted(settled_widths, reverse=True)
+    assert fine[-1][3] <= 0.1 and coarse[-1][3] <= 0.1
+    stop_entries = [
+        entry for entry in experiment.inquiry_snapshot(inquiry_id)["decisions"]
+        if entry["action"] == "stop"
+    ]
+    assert len(stop_entries) == 1

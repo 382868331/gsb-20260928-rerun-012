@@ -109,6 +109,8 @@ export interface InquiryDecision {
   decision_id: string;
   at: number;
   action: "created" | "sample" | "stop";
+  rule_version?: string;
+  rule_description?: string;
   branch_id: string | null;
   shots: number;
   reason: string;
@@ -135,6 +137,8 @@ export interface BranchInquiryStat {
 
 export interface InquiryEvaluation {
   status: "continue" | "decided" | "inconclusive_budget_exhausted";
+  rule_version: string;
+  rule_description: string;
   remaining_budget: number;
   used_budget: number;
   branch_statistics: BranchInquiryStat[];
@@ -153,6 +157,9 @@ export interface BranchInquiry {
   batch_size: number;
   alpha: number;
   immutable: boolean;
+  rule_version: string;
+  rule_description: string;
+  rule_note?: string | null;
   status: "active" | "decided" | "inconclusive_budget_exhausted";
   current_evaluation: InquiryEvaluation;
   decisions: InquiryDecision[];

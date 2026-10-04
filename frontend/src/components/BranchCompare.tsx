@@ -505,6 +505,10 @@ function InquiryPanel({
             事件 {inquiry.event}；允许误差 ±{inquiry.margin}；已用 {inquiry.current_evaluation.used_budget}/
             {inquiry.total_budget}；批量 {inquiry.batch_size}。
           </p>
+          <p className="muted">
+            规则：{inquiry.rule_version}（{inquiry.rule_description}）
+          </p>
+          {inquiry.rule_note && <div className="notice-box">{inquiry.rule_note}</div>}
           {inquiry.current_evaluation.conclusion && <div className="notice-box">{inquiry.current_evaluation.conclusion.message}</div>}
           {inquiry.current_evaluation.branch_statistics.map((stat) => (
             <p key={stat.branch_id} className="muted">
@@ -519,7 +523,7 @@ function InquiryPanel({
             <summary>停止规则与预算分配审计（{inquiry.decisions.length}）</summary>
             <ol className="decision-log">
               {inquiry.decisions.map((decision) => (
-                <li key={decision.decision_id}>{decision.action}：{decision.reason}（{decision.shots} 次）</li>
+                <li key={decision.decision_id}>[{decision.rule_version ?? "unknown"}] {decision.action}：{decision.reason}（{decision.shots} 次）</li>
               ))}
             </ol>
           </details>
