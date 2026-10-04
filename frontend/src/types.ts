@@ -108,7 +108,7 @@ export interface BranchExperimentResult {
 export interface InquiryDecision {
   decision_id: string;
   at: number;
-  action: "created" | "sample" | "stop";
+  action: "created" | "sample" | "stop" | "rule_migrated";
   branch_id: string | null;
   shots: number;
   reason: string;

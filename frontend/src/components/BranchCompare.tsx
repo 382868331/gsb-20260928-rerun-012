@@ -264,6 +264,8 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
               {loadingId === "create" ? "运行中…" : "运行独立分支样本"}
             </button>
           </div>
+        </>
+      )}
           {error && <div className="error-box">{error}</div>}
           {result && (
             <ExperimentResult
@@ -276,8 +278,6 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
               onAdaptiveBatch={continueAdaptive}
             />
           )}
-        </>
-      )}
     </section>
   );
 }

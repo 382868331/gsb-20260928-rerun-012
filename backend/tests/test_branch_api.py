@@ -104,3 +104,93 @@ def test_branch_experiment_create_get_and_patch(monkeypatch, tmp_path):
     assert updated["branches"][0]["completed_shots"] == 17
     assert updated["branches"][1]["completed_shots"] == 8
     assert updated["branches"][0]["batches"][-1]["source"] == "api-extra"
+
+
+def test_inquiry_write_is_visible_to_cached_get_and_survives_reload(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "BRANCH_DIR", tmp_path)
+    monkeypatch.setattr(server, "BRANCH_EXPERIMENTS", {})
+    _make_checkpoint()
+    create_handler = DummyHandler(
+        {
+            "name": "api-inquiry",
+            "seed": 77,
+            "branches": [
+                {"branch_id": "a", "label": "A", "steps": [], "budget": 100},
+                {"branch_id": "b", "label": "B", "steps": [], "budget": 100},
+            ],
+        }
+    )
+    create_handler.path = "/api/checkpoints/cp-api/branch-experiments"
+    server.Handler.do_POST(create_handler)
+    experiment_id = create_handler.response.body["experiment_id"]
+
+    inquiry_payload = {
+        "inquiry": {
+            "mode": "compare",
+            "branch_ids": ["a", "b"],
+            "event": "00",
+            "margin": 0.01,
+            "total_budget": 210,
+            "batch_size": 10,
+        }
+    }
+    inquiry_handler = DummyHandler(inquiry_payload)
+    inquiry_handler.path = f"/api/branch-experiments/{experiment_id}/inquiries"
+    server.Handler.do_PATCH(inquiry_handler)
+    inquiry_id = inquiry_handler.response.body["inquiry_id"]
+    assert inquiry_handler.response.body["decisions"][0]["action"] == "created"
+
+    get_handler = DummyHandler({})
+    get_handler.path = f"/api/branch-experiments/{experiment_id}"
+    server.Handler.do_GET(get_handler)
+    assert [item["inquiry_id"] for item in get_handler.response.body["inquiries"]] == [inquiry_id]
+
+    batch_handler = DummyHandler({})
+    batch_handler.path = (
+        f"/api/branch-experiments/{experiment_id}/inquiries/{inquiry_id}/adaptive-batch"
+    )
+    server.Handler.do_PATCH(batch_handler)
+    assert batch_handler.response.status == HTTPStatus.OK
+    sampled_branch = next(
+        branch
+        for branch in batch_handler.response.body["branches"]
+        if branch["batches"][-1]["source"] == f"adaptive:{inquiry_id}"
+    )
+    assert sampled_branch["batches"][-1]["shots"] == 10
+
+    changed_inquiry_handler = DummyHandler(
+        {"inquiry": {**inquiry_payload["inquiry"], "event": "__pass__"}}
+    )
+    changed_inquiry_handler.path = f"/api/branch-experiments/{experiment_id}/inquiries"
+    server.Handler.do_PATCH(changed_inquiry_handler)
+    second_inquiry_id = changed_inquiry_handler.response.body["inquiry_id"]
+    assert second_inquiry_id != inquiry_id
+
+    server.BRANCH_EXPERIMENTS.clear()
+    reopen_handler = DummyHandler({})
+    reopen_handler.path = f"/api/branch-experiments/{experiment_id}"
+    server.Handler.do_GET(reopen_handler)
+    reopened = reopen_handler.response.body
+    assert [item["inquiry_id"] for item in reopened["inquiries"]] == [
+        inquiry_id,
+        second_inquiry_id,
+    ]
+    assert reopened["inquiries"][0]["event"] == "00"
+    assert reopened["inquiries"][1]["event"] == "__pass__"
+    adaptive_branch = next(
+        branch for branch in reopened["branches"] if branch["completed_shots"] == 110
+    )
+    assert adaptive_branch["batches"] == [
+        {
+            "batch_id": adaptive_branch["batches"][0]["batch_id"],
+            "source": "initial-budget",
+            "shots": 100,
+            "total_shots_after_batch": 100,
+        },
+        {
+            "batch_id": adaptive_branch["batches"][1]["batch_id"],
+            "source": f"adaptive:{inquiry_id}",
+            "shots": 10,
+            "total_shots_after_batch": 110,
+        },
+    ]

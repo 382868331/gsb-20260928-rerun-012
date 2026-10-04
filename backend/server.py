@@ -305,7 +305,7 @@ def _branch_storage_dir(payload: dict[str, Any]) -> Path:
 
 
 def _load_branch_experiment(experiment_id: str, storage_dir: str | Path | None = None) -> branch_store.BranchExperiment:
-    if storage_dir is not None:
+    if storage_dir is not None and Path(storage_dir) != BRANCH_DIR:
         return branch_store.BranchExperiment.load(Path(storage_dir) / f"{experiment_id}.json")
     with SESSIONS_LOCK:
         cached = BRANCH_EXPERIMENTS.get(experiment_id)
@@ -689,7 +689,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             experiment_id = parts[2]
             try:
-                storage_dir = _branch_storage_dir(payload)
+                raw_storage_dir = payload.get("storage_dir")
+                storage_dir = None if raw_storage_dir is None else _branch_storage_dir(payload)
                 experiment = _load_branch_experiment(experiment_id, storage_dir)
             except ValueError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -722,6 +723,8 @@ class Handler(BaseHTTPRequestHandler):
                             raise ValueError("batch_size must be a positive integer")
                         evaluation = experiment.run_adaptive_batch(inquiry_id, batch_size=batch_size)
                         response = {"evaluation": evaluation, **experiment.snapshot()}
+                if experiment.storage_dir == BRANCH_DIR:
+                    BRANCH_EXPERIMENTS[experiment.experiment_id] = experiment
             except KeyError as exc:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
                 return
