@@ -104,3 +104,59 @@ def test_branch_experiment_create_get_and_patch(monkeypatch, tmp_path):
     assert updated["branches"][0]["completed_shots"] == 17
     assert updated["branches"][1]["completed_shots"] == 8
     assert updated["branches"][0]["batches"][-1]["source"] == "api-extra"
+
+    inquiry_payload = {
+        "mode": "compare",
+        "branch_ids": ["flip", "idle"],
+        "event": "__pass__",
+        "margin": 0.01,
+        "total_budget": 210,
+        "batch_size": 10,
+    }
+    inquiry_handler = DummyHandler({"inquiry": inquiry_payload})
+    inquiry_handler.path = (
+        f"/api/branch-experiments/{created['experiment_id']}/inquiries"
+    )
+    server.Handler.do_PATCH(inquiry_handler)
+    assert inquiry_handler.response.status == HTTPStatus.OK
+    created_inquiry = inquiry_handler.response.body["inquiries"][-1]
+    assert created_inquiry["event"] == "__pass__"
+    assert created_inquiry["total_budget"] == 210
+    assert created_inquiry["decisions"][0]["action"] == "created"
+
+    server.Handler.do_GET(handler)
+    assert handler.response.status == HTTPStatus.OK
+    assert [item["inquiry_id"] for item in handler.response.body["inquiries"]] == [
+        created_inquiry["inquiry_id"]
+    ]
+
+    adaptive_handler = DummyHandler({})
+    adaptive_handler.path = (
+        f"/api/branch-experiments/{created['experiment_id']}"
+        f"/inquiries/{created_inquiry['inquiry_id']}/adaptive-batch"
+    )
+    server.Handler.do_PATCH(adaptive_handler)
+    assert adaptive_handler.response.status == HTTPStatus.OK
+    assert adaptive_handler.response.body["evaluation"]["used_budget"] == 10
+    selected_branch = next(
+        branch
+        for branch in adaptive_handler.response.body["branches"]
+        if branch["batches"][-1]["source"]
+        == f"adaptive:{created_inquiry['inquiry_id']}"
+    )
+    assert selected_branch["batches"][-1]["shots"] == 10
+
+    server.BRANCH_EXPERIMENTS.clear()
+    server.Handler.do_GET(handler)
+    reopened = handler.response.body
+    assert reopened["inquiries"][0]["inquiry_id"] == created_inquiry["inquiry_id"]
+    assert any(
+        decision["action"] == "sample"
+        and decision["batch_id"] == selected_branch["batches"][-1]["batch_id"]
+        for decision in reopened["inquiries"][0]["decisions"]
+    )
+    assert any(
+        batch["source"] == f"adaptive:{created_inquiry['inquiry_id']}"
+        for branch in reopened["branches"]
+        for batch in branch["batches"]
+    )

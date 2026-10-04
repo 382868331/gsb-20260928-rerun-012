@@ -179,8 +179,7 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
     setLoadingId("inquiry-create");
     setError("");
     try {
-      await createBranchInquiry(result.experiment_id, inquiry);
-      setResult(await getBranchExperiment(result.experiment_id));
+      setResult(await createBranchInquiry(result.experiment_id, inquiry));
     } catch (err) {
       const payload = err as { error?: string };
       setError(payload.error ?? "创建研究决定失败");

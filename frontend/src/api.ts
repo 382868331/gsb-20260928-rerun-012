@@ -100,8 +100,8 @@ export function createBranchInquiry(experimentId: string, inquiry: {
   margin: number;
   total_budget: number;
   batch_size: number;
-}) {
-  return request<BranchInquiry>(
+}): Promise<BranchExperiment> {
+  return request<BranchExperiment>(
     `/api/branch-experiments/${encodeURIComponent(experimentId)}/inquiries`,
     "PATCH",
     { inquiry },

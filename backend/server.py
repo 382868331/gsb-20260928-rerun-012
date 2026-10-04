@@ -305,7 +305,8 @@ def _branch_storage_dir(payload: dict[str, Any]) -> Path:
 
 
 def _load_branch_experiment(experiment_id: str, storage_dir: str | Path | None = None) -> branch_store.BranchExperiment:
-    if storage_dir is not None:
+    requested_dir = Path(storage_dir) if storage_dir is not None else BRANCH_DIR
+    if requested_dir.resolve() != BRANCH_DIR.resolve():
         return branch_store.BranchExperiment.load(Path(storage_dir) / f"{experiment_id}.json")
     with SESSIONS_LOCK:
         cached = BRANCH_EXPERIMENTS.get(experiment_id)
@@ -710,7 +711,8 @@ class Handler(BaseHTTPRequestHandler):
                         experiment.add_shots(branch_id, shots, source=source.strip())
                         response = experiment.snapshot()
                     elif route == "inquiries":
-                        response = experiment.add_inquiry(payload.get("inquiry", payload))
+                        experiment.add_inquiry(payload.get("inquiry", payload))
+                        response = experiment.snapshot()
                     else:
                         inquiry_id = parts[4]
                         batch_size = payload.get("batch_size")
