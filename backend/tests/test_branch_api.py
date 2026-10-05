@@ -160,3 +160,47 @@ def test_branch_experiment_create_get_and_patch(monkeypatch, tmp_path):
         for branch in reopened["branches"]
         for batch in branch["batches"]
     )
+
+    event_ids = list(next(
+        branch["counts"] for branch in created["branches"] if len(branch["counts"]) > 1
+    ).keys())
+    shared_branch = next(
+        branch["branch_id"] for branch in created["branches"] if len(branch["counts"]) > 1
+    )
+    plan_payload = {
+        "strategy": "balanced",
+        "total_budget": 5,
+        "goals": [
+            {
+                "goal_id": "event-a",
+                "mode": "single",
+                "branch_ids": [shared_branch],
+                "event": event_ids[0],
+                "margin": 0.01,
+                "batch_size": 2,
+            },
+            {
+                "goal_id": "event-b",
+                "mode": "single",
+                "branch_ids": [shared_branch],
+                "event": event_ids[1],
+                "margin": 0.01,
+                "batch_size": 2,
+            },
+        ],
+    }
+    plan_handler = DummyHandler({"research_plan": plan_payload})
+    plan_handler.path = f"/api/branch-experiments/{created['experiment_id']}/research-plans"
+    server.Handler.do_PATCH(plan_handler)
+    assert plan_handler.response.status == HTTPStatus.OK
+    plan_id = plan_handler.response.body["research_plan"]["plan_id"]
+
+    batch_handler = DummyHandler({})
+    batch_handler.path = (
+        f"/api/branch-experiments/{created['experiment_id']}/research-plans/{plan_id}/batches"
+    )
+    server.Handler.do_PATCH(batch_handler)
+    assert batch_handler.response.status == HTTPStatus.OK
+    plan = batch_handler.response.body["research_plan"]
+    assert plan["executed_shots"] == 2
+    assert plan["batches"][0]["goal_ids"] == ["event-a", "event-b"]

@@ -179,6 +179,64 @@ export interface BranchExperiment {
   };
   branches: BranchExperimentResult[];
   inquiries: BranchInquiry[];
+  research_plans: ResearchPlan[];
+}
+
+export interface ResearchGoalDecision {
+  decision_id: string;
+  at: number;
+  action: "created" | "sample" | "stop" | "cancel" | "adopt_existing_samples";
+  branch_id: string | null;
+  shots: number;
+  reason: string;
+  batch_id: string | null;
+  batch_ids: string[];
+  evaluation_after?: InquiryEvaluation;
+}
+
+export interface ResearchGoal {
+  goal_id: string;
+  label: string;
+  priority: number;
+  mode: "single" | "compare";
+  branch_ids: [string] | [string, string];
+  event: string;
+  margin: number;
+  total_budget: number;
+  batch_size: number;
+  alpha: number;
+  status: "active" | "decided" | "inconclusive_budget_exhausted" | "cancelled";
+  adopted_batch_ids: string[];
+  current_evaluation: InquiryEvaluation & { adopted_shots: number };
+  decisions: ResearchGoalDecision[];
+}
+
+export interface ResearchPlanBatch {
+  batch_id: string;
+  branch_id: string;
+  shots: number;
+  leader_goal_id: string;
+  goal_ids: string[];
+}
+
+export interface ResearchPlan {
+  plan_id: string;
+  created_at: number;
+  name: string;
+  strategy: "balanced" | "priority";
+  total_budget: number;
+  executed_shots: number;
+  remaining_budget: number;
+  priority_goal_ids: string[];
+  goal_order: string[];
+  goals: ResearchGoal[];
+  batches: ResearchPlanBatch[];
+  next_batch: {
+    leader_goal_id: string;
+    branch_id: string;
+    shots: number;
+    eligible_goal_ids: string[];
+  } | null;
 }
 
 export interface ExperimentResult {

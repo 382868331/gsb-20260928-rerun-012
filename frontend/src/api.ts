@@ -7,6 +7,7 @@ import type {
   CircuitStep,
   Circuit,
   ExperimentResult,
+  ResearchPlan,
   SavedCircuit,
   SessionState,
   ValidationError,
@@ -113,6 +114,44 @@ export function runAdaptiveBatch(experimentId: string, inquiryId: string, batchS
     `/api/branch-experiments/${encodeURIComponent(experimentId)}/inquiries/${encodeURIComponent(inquiryId)}/adaptive-batch`,
     "PATCH",
     batchSize === undefined ? {} : { batch_size: batchSize },
+  );
+}
+
+export function createResearchPlan(experimentId: string, researchPlan: {
+  strategy: "balanced" | "priority";
+  total_budget: number;
+  priority_goal_ids?: string[];
+  goals: Array<{
+    goal_id?: string;
+    label?: string;
+    mode: "single" | "compare";
+    branch_ids: string[];
+    event: string;
+    margin: number;
+    batch_size: number;
+    priority?: number;
+  }>;
+}): Promise<{ research_plan: ResearchPlan } & BranchExperiment> {
+  return request<{ research_plan: ResearchPlan } & BranchExperiment>(
+    `/api/branch-experiments/${encodeURIComponent(experimentId)}/research-plans`,
+    "PATCH",
+    { research_plan: researchPlan },
+  );
+}
+
+export function runResearchBatch(experimentId: string, planId: string) {
+  return request<{ research_plan: ResearchPlan } & BranchExperiment>(
+    `/api/branch-experiments/${encodeURIComponent(experimentId)}/research-plans/${encodeURIComponent(planId)}/batches`,
+    "PATCH",
+    {},
+  );
+}
+
+export function cancelResearchGoal(experimentId: string, planId: string, goalId: string) {
+  return request<{ research_plan: ResearchPlan } & BranchExperiment>(
+    `/api/branch-experiments/${encodeURIComponent(experimentId)}/research-plans/${encodeURIComponent(planId)}/goals/${encodeURIComponent(goalId)}/cancel`,
+    "PATCH",
+    {},
   );
 }
 

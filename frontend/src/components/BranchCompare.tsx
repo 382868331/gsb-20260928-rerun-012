@@ -2,10 +2,13 @@ import { useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import {
   addBranchShots,
+  cancelResearchGoal,
   createBranchExperiment,
   createBranchInquiry,
+  createResearchPlan,
   getBranchExperiment,
   runAdaptiveBatch,
+  runResearchBatch,
 } from "../api";
 import { newStepId } from "../store";
 import type { BranchExperiment, CheckpointState, CircuitStep, GateType, MeasurementFilter } from "../types";
@@ -202,6 +205,82 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
     }
   }
 
+  async function createPlan(strategy: "balanced" | "priority") {
+    if (!result || busy) return;
+    const branchId = result.branches[0]?.branch_id;
+    const eventIds = Object.keys(result.branches[0]?.counts ?? {});
+    if (!branchId || eventIds.length < 2) return;
+    const priorityEvent = eventIds[1];
+    const commonEvent = eventIds[0];
+    setLoadingId("plan-create");
+    setError("");
+    try {
+      const response = await createResearchPlan(result.experiment_id, {
+        strategy,
+        total_budget: 1000,
+        priority_goal_ids: strategy === "priority" ? ["priority-event"] : undefined,
+        goals: [
+          {
+            goal_id: "priority-event",
+            label: `优先事件 |${priorityEvent}⟩`,
+            mode: "single",
+            branch_ids: [branchId],
+            event: priorityEvent,
+            margin: 0.03,
+            batch_size: 25,
+            priority: 0,
+          },
+          {
+            goal_id: "comparison-event",
+            label: `对照事件 |${commonEvent}⟩`,
+            mode: "single",
+            branch_ids: [branchId],
+            event: commonEvent,
+            margin: 0.03,
+            batch_size: 25,
+            priority: 1,
+          },
+        ],
+      });
+      setResult(response);
+    } catch (err) {
+      const payload = err as { error?: string };
+      setError(payload.error ?? "创建共享研究计划失败");
+    } finally {
+      setLoadingId("");
+    }
+  }
+
+  async function continuePlan(planId: string) {
+    if (!result || busy) return;
+    setLoadingId(planId);
+    setError("");
+    try {
+      const response = await runResearchBatch(result.experiment_id, planId);
+      setResult(response);
+    } catch (err) {
+      const payload = err as { error?: string };
+      setError(payload.error ?? "执行共享研究批次失败");
+    } finally {
+      setLoadingId("");
+    }
+  }
+
+  async function cancelGoal(planId: string, goalId: string) {
+    if (!result || busy) return;
+    setLoadingId(`${planId}:${goalId}`);
+    setError("");
+    try {
+      const response = await cancelResearchGoal(result.experiment_id, planId, goalId);
+      setResult(response);
+    } catch (err) {
+      const payload = err as { error?: string };
+      setError(payload.error ?? "取消研究目标失败");
+    } finally {
+      setLoadingId("");
+    }
+  }
+
   return (
     <section className="panel">
       <h2>中途测量后的条件分支实验</h2>
@@ -273,6 +352,9 @@ export function BranchCompare({ checkpoints, disabled }: Props) {
               onContinue={continueBranch}
               onAddInquiry={addInquiry}
               onAdaptiveBatch={continueAdaptive}
+              onCreatePlan={createPlan}
+              onRunPlanBatch={continuePlan}
+              onCancelGoal={cancelGoal}
             />
           )}
         </>
@@ -369,6 +451,9 @@ function ExperimentResult({
   onContinue,
   onAddInquiry,
   onAdaptiveBatch,
+  onCreatePlan,
+  onRunPlanBatch,
+  onCancelGoal,
 }: {
   result: BranchExperiment;
   branches: BranchDraft[];
@@ -384,6 +469,9 @@ function ExperimentResult({
     batch_size: number;
   }) => void;
   onAdaptiveBatch: (inquiryId: string) => void;
+  onCreatePlan: (strategy: "balanced" | "priority") => void;
+  onRunPlanBatch: (planId: string) => void;
+  onCancelGoal: (planId: string, goalId: string) => void;
 }) {
   return (
     <div className="branch-results">
@@ -427,6 +515,68 @@ function ExperimentResult({
         );
       })}
       <InquiryPanel result={result} busy={busy} loadingId={loadingId} onAddInquiry={onAddInquiry} onAdaptiveBatch={onAdaptiveBatch} />
+      <ResearchPlanPanel result={result} busy={busy} loadingId={loadingId} onCreate={onCreatePlan} onBatch={onRunPlanBatch} onCancelGoal={onCancelGoal} />
+    </div>
+  );
+}
+
+function ResearchPlanPanel({
+  result,
+  busy,
+  loadingId,
+  onCreate,
+  onBatch,
+  onCancelGoal,
+}: {
+  result: BranchExperiment;
+  busy: boolean;
+  loadingId: string;
+  onCreate: (strategy: "balanced" | "priority") => void;
+  onBatch: (planId: string) => void;
+  onCancelGoal: (planId: string, goalId: string) => void;
+}) {
+  return (
+    <div className="inquiry-panel">
+      <h3>多目标共享采样预算</h3>
+      <p className="muted">
+        仅相同分支（相同后续电路与筛选条件）的目标可共用实际样本；互斥事件可共享同一批，条件不同的分支只分别推进。
+      </p>
+      <div className="inline-controls">
+        <button type="button" disabled={busy || result.branches.length === 0} onClick={() => onCreate("balanced")}>
+          {loadingId === "plan-create" ? "创建中…" : "创建均衡推进计划"}
+        </button>
+        <button type="button" disabled={busy || result.branches.length === 0} onClick={() => onCreate("priority")}>
+          创建优先完成稀有事件计划
+        </button>
+      </div>
+      {result.research_plans.map((plan) => (
+        <div key={plan.plan_id} className="branch-result">
+          <strong>{plan.strategy === "balanced" ? "均衡推进" : "优先完成"} · {plan.executed_shots}/{plan.total_budget}</strong>
+          {plan.next_batch && (
+            <p className="muted">
+              下一批：分支 {plan.next_batch.branch_id}，{plan.next_batch.shots} 次；
+              服务目标 {plan.next_batch.eligible_goal_ids.join(", ")}，执行预算只扣一次。
+            </p>
+          )}
+          {plan.goals.map((goal) => (
+            <div key={goal.goal_id} className="muted">
+              <strong>{goal.label}</strong> · {goal.status} · 事件 {goal.event}
+              <p>
+                已采用 {goal.current_evaluation.adopted_shots} 个样本；停止原因：
+                {goal.current_evaluation.conclusion?.message ?? (goal.status === "active" ? "继续采样" : "已停止")}
+              </p>
+              {goal.status === "active" && (
+                <button type="button" disabled={busy} onClick={() => onCancelGoal(plan.plan_id, goal.goal_id)}>
+                  取消此目标
+                </button>
+              )}
+            </div>
+          ))}
+          <button type="button" disabled={busy || !plan.next_batch} onClick={() => onBatch(plan.plan_id)}>
+            {loadingId === plan.plan_id ? "执行中…" : "执行下一批"}
+          </button>
+        </div>
+      ))}
     </div>
   );
 }
