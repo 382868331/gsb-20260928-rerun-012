@@ -201,6 +201,8 @@ class BranchExperiment:
         self.storage_dir = Path(storage_dir)
         self.inquiries = inquiries or {}
         self.inquiry_order = inquiry_order or []
+        self.research_plans = {}
+        self.research_plan_order = []
 
     @property
     def path(self) -> Path:
@@ -405,14 +407,14 @@ class BranchExperiment:
             if entry.get("action") == "sample"
         )
 
-    def _evaluate_inquiry(self, inquiry: dict[str, Any]) -> dict[str, Any]:
+    def _evaluate_inquiry(self, inquiry: dict[str, Any], *, used_budget: int | None = None) -> dict[str, Any]:
         alpha = float(inquiry["alpha"])
         margin = float(inquiry["margin"])
         stats = [
             self._branch_uncertainty(branch_id, inquiry["event"], alpha)
             for branch_id in inquiry["branch_ids"]
         ]
-        used = self._inquiry_used_budget(inquiry)
+        used = self._inquiry_used_budget(inquiry) if used_budget is None else int(used_budget)
         total_budget = int(inquiry["total_budget"])
         status = "continue"
         conclusion = None
@@ -635,6 +637,336 @@ class BranchExperiment:
         self.save()
         return evaluation
 
+    @staticmethod
+    def normalize_research_goal(
+        raw: dict[str, Any],
+        branch_ids: list[str],
+        known_events: set[str],
+        *,
+        default_batch_size: int,
+    ) -> dict[str, Any]:
+        goal = BranchExperiment.normalize_inquiry(
+            {
+                "total_budget": 1_000_000,
+                "batch_size": default_batch_size,
+                **raw,
+            },
+            branch_ids,
+            known_events,
+        )
+        goal_id = raw.get("goal_id") or raw.get("inquiry_id") or goal["inquiry_id"]
+        if not isinstance(goal_id, str) or not goal_id.strip():
+            raise ValueError("goal_id must be a non-empty string")
+        goal["goal_id"] = goal_id.strip()
+        goal["inquiry_id"] = goal["goal_id"]
+        goal.pop("total_budget", None)
+        goal["kind"] = "research_goal"
+        return goal
+
+    @staticmethod
+    def _distribution_fingerprint(branch: dict[str, Any]) -> str:
+        payload = json.dumps(
+            {
+                "steps": branch.get("steps", []),
+                "filters": branch.get("filters", []),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def create_research_plan(self, raw_plan: dict[str, Any]) -> dict[str, Any]:
+        policy = raw_plan.get("policy", "balanced")
+        if policy not in ("balanced", "priority"):
+            raise ValueError("research plan policy must be 'balanced' or 'priority'")
+        total_budget = raw_plan.get("total_budget")
+        if not isinstance(total_budget, int) or isinstance(total_budget, bool) or not 1 <= total_budget <= 1_000_000:
+            raise ValueError("research plan total_budget must be an integer in [1, 1000000]")
+        batch_size = raw_plan.get("batch_size", 1)
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or not 1 <= batch_size <= total_budget:
+            raise ValueError("research plan batch_size must be a positive integer not exceeding total_budget")
+        raw_goals = raw_plan.get("goals")
+        if not isinstance(raw_goals, list) or not raw_goals:
+            raise ValueError("research plan goals must be a non-empty list")
+        events = set(next(iter(self.branches.values()))["counts"].keys())
+        goals = [
+            self.normalize_research_goal(
+                raw,
+                list(self.branch_order),
+                events,
+                default_batch_size=int(batch_size),
+            )
+            for raw in raw_goals
+        ]
+        goal_ids = [goal["goal_id"] for goal in goals]
+        if len(set(goal_ids)) != len(goal_ids):
+            raise ValueError("research goal ids must be unique")
+        for goal in goals:
+            goal["total_budget"] = int(total_budget)
+        priority_goal_ids = list(raw_plan.get("priority_goal_ids", []))
+        if not all(isinstance(item, str) for item in priority_goal_ids):
+            raise ValueError("priority_goal_ids must be goal id strings")
+        if any(item not in goal_ids for item in priority_goal_ids):
+            raise ValueError("priority_goal_ids must reference goals in this plan")
+        plan_id = raw_plan.get("plan_id") or uuid.uuid4().hex
+        if not isinstance(plan_id, str) or not plan_id.strip():
+            raise ValueError("plan_id must be a non-empty string")
+        plan_id = plan_id.strip()
+        if plan_id in self.research_plans:
+            raise ValueError(f"research plan already exists: {plan_id}")
+        plan = {
+            "plan_id": plan_id,
+            "created_at": time.time(),
+            "policy": policy,
+            "total_budget": int(total_budget),
+            "used_budget": 0,
+            "batch_size": int(batch_size),
+            "priority_goal_ids": priority_goal_ids,
+            "goal_order": goal_ids,
+            "goals": {goal["goal_id"]: goal for goal in goals},
+            "joint_batches": [],
+            "status": "active",
+        }
+        fingerprints = {
+            branch_id: self._distribution_fingerprint(branch)
+            for branch_id, branch in self.branches.items()
+        }
+        plan["distribution_fingerprints"] = fingerprints
+        for goal in goals:
+            self._record_research_goal_decision(
+                plan,
+                goal,
+                action="created",
+                branch_id=None,
+                shots=0,
+                charged_shots=0,
+                reason="研究目标已登记；目标独立保存置信依据，物理样本由研究计划共享预算统一安排",
+            )
+        self.research_plans[plan_id] = plan
+        self.research_plan_order.append(plan_id)
+        self.save()
+        return self.research_plan_snapshot(plan_id)
+
+    def _record_research_goal_decision(
+        self,
+        plan: dict[str, Any],
+        goal: dict[str, Any],
+        *,
+        action: str,
+        branch_id: str | None,
+        shots: int,
+        charged_shots: int,
+        reason: str,
+        evaluation: dict[str, Any] | None = None,
+        batch_id: str | None = None,
+        served_goal_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        entry = {
+            "decision_id": uuid.uuid4().hex,
+            "at": time.time(),
+            "action": action,
+            "branch_id": branch_id,
+            "shots": int(shots),
+            "charged_shots": int(charged_shots),
+            "reason": reason,
+            "batch_id": batch_id,
+            "served_goal_ids": list(served_goal_ids or ([goal["goal_id"]] if shots else [])),
+            "evaluation_after": evaluation,
+        }
+        goal.setdefault("decisions", []).append(entry)
+        return entry
+
+    def _active_research_goals(self, plan: dict[str, Any]) -> list[dict[str, Any]]:
+        return [plan["goals"][goal_id] for goal_id in plan["goal_order"] if plan["goals"][goal_id].get("status") == "active"]
+
+    def _evaluate_research_goal(self, plan: dict[str, Any], goal: dict[str, Any]) -> dict[str, Any]:
+        evaluation = self._evaluate_inquiry(goal, used_budget=int(plan["used_budget"]))
+        evaluation["goal_id"] = goal["goal_id"]
+        evaluation["shared_plan_used_budget"] = int(plan["used_budget"])
+        return evaluation
+
+    def _research_candidate(self, plan: dict[str, Any], goal: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        evaluation = self._evaluate_research_goal(plan, goal)
+        chosen = max(evaluation["branch_statistics"], key=lambda item: (item["allocation_score"], item["branch_id"]))
+        return chosen, evaluation
+
+    def run_research_plan_batch(self, plan_id: str) -> dict[str, Any]:
+        if plan_id not in self.research_plans:
+            raise KeyError(f"unknown research plan: {plan_id}")
+        plan = self.research_plans[plan_id]
+        if plan.get("status") != "active":
+            raise ValueError("this research plan has already stopped")
+        active_goals = self._active_research_goals(plan)
+        if not active_goals:
+            plan["status"] = "stopped"
+            self.save()
+            return self.research_plan_snapshot(plan_id)
+
+        for goal in list(active_goals):
+            evaluation = self._evaluate_research_goal(plan, goal)
+            if evaluation["status"] != "continue":
+                goal["status"] = evaluation["status"]
+                self._record_research_goal_decision(
+                    plan,
+                    goal,
+                    action="stop",
+                    branch_id=None,
+                    shots=0,
+                    charged_shots=0,
+                    reason=evaluation["conclusion"]["message"],
+                    evaluation=evaluation,
+                )
+        active_goals = self._active_research_goals(plan)
+        if not active_goals:
+            plan["status"] = "stopped"
+            self.save()
+            return self.research_plan_snapshot(plan_id)
+        before = {goal["goal_id"]: self._evaluate_research_goal(plan, goal) for goal in active_goals}
+        if plan["policy"] == "priority":
+            priority = [goal_id for goal_id in plan["priority_goal_ids"] if plan["goals"][goal_id].get("status") == "active"]
+            target_goals = [plan["goals"][priority[0]]] if priority else active_goals
+        else:
+            target_goals = active_goals
+
+        candidates: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        for goal in target_goals:
+            chosen, evaluation = self._research_candidate(plan, goal)
+            branch_id = chosen["branch_id"]
+            previous = candidates.get(branch_id)
+            if previous is None or chosen["allocation_score"] > previous[0]["allocation_score"]:
+                candidates[branch_id] = (chosen, evaluation)
+
+        remaining = int(plan["total_budget"]) - int(plan["used_budget"])
+        groups: list[dict[str, Any]] = []
+        for branch_id in self.branch_order:
+            if branch_id not in candidates or remaining <= 0:
+                continue
+            chosen, _ = candidates[branch_id]
+            shots = min(int(plan["batch_size"]), remaining)
+            serving_goals = [
+                goal for goal in active_goals if branch_id in goal["branch_ids"]
+            ]
+            batch = self._sample(
+                self.branches[branch_id],
+                shots,
+                source=f"research-plan:{plan_id}",
+            )
+            plan["used_budget"] += shots
+            remaining -= shots
+            served_ids = [goal["goal_id"] for goal in serving_goals]
+            group = {
+                "joint_batch_id": uuid.uuid4().hex,
+                "batch_id": batch["batch_id"],
+                "branch_id": branch_id,
+                "distribution_fingerprint": plan["distribution_fingerprints"][branch_id],
+                "shots": shots,
+                "charged_shots": shots,
+                "served_goal_ids": served_ids,
+            }
+            plan["joint_batches"].append(group)
+            groups.append(group)
+
+        active_after = self._active_research_goals(plan)
+        for goal in active_after:
+            evaluation = self._evaluate_research_goal(plan, goal)
+            served_groups = [group for group in groups if goal["goal_id"] in group["served_goal_ids"]]
+            for group in served_groups:
+                self._record_research_goal_decision(
+                    plan,
+                    goal,
+                    action="sample",
+                    branch_id=group["branch_id"],
+                    shots=group["shots"],
+                    charged_shots=0 if len(group["served_goal_ids"]) > 1 else group["charged_shots"],
+                    reason="同一实际分支样本用于该目标；执行预算只在研究计划层扣减一次",
+                    batch_id=group["batch_id"],
+                    served_goal_ids=group["served_goal_ids"],
+                    evaluation=evaluation,
+                )
+            if evaluation["status"] != "continue":
+                goal["status"] = evaluation["status"]
+                self._record_research_goal_decision(
+                    plan,
+                    goal,
+                    action="stop",
+                    branch_id=None,
+                    shots=0,
+                    charged_shots=0,
+                    reason=evaluation["conclusion"]["message"],
+                    evaluation=evaluation,
+                )
+
+        if int(plan["used_budget"]) >= int(plan["total_budget"]):
+            for goal in self._active_research_goals(plan):
+                evaluation = self._evaluate_research_goal(plan, goal)
+                if evaluation["status"] == "continue":
+                    goal["status"] = "inconclusive_budget_exhausted"
+                    evaluation["status"] = goal["status"]
+                    evaluation["conclusion"] = {
+                        "type": "inconclusive",
+                        "message": "共享执行预算已用完但该目标精度仍未满足；结果保持未确定",
+                    }
+                self._record_research_goal_decision(
+                    plan,
+                    goal,
+                    action="stop",
+                    branch_id=None,
+                    shots=0,
+                    charged_shots=0,
+                    reason=evaluation["conclusion"]["message"],
+                    evaluation=evaluation,
+                )
+        if not self._active_research_goals(plan):
+            plan["status"] = "stopped"
+        self.save()
+        return self.research_plan_snapshot(plan_id)
+
+    def cancel_research_goal(self, plan_id: str, goal_id: str, *, reason: str | None = None) -> dict[str, Any]:
+        if plan_id not in self.research_plans:
+            raise KeyError(f"unknown research plan: {plan_id}")
+        plan = self.research_plans[plan_id]
+        if goal_id not in plan["goals"]:
+            raise KeyError(f"unknown research goal: {goal_id}")
+        goal = plan["goals"][goal_id]
+        if goal.get("status") != "active":
+            raise ValueError("this research goal has already stopped")
+        goal["status"] = "cancelled"
+        message = reason or "研究目标已取消；既有样本、其他目标决策和已扣共享预算均保留"
+        self._record_research_goal_decision(
+            plan,
+            goal,
+            action="cancel",
+            branch_id=None,
+            shots=0,
+            charged_shots=0,
+            reason=message,
+        )
+        if not self._active_research_goals(plan):
+            plan["status"] = "stopped"
+        self.save()
+        return self.research_plan_snapshot(plan_id)
+
+    def research_goal_snapshot(self, plan: dict[str, Any], goal: dict[str, Any]) -> dict[str, Any]:
+        evaluation = self._evaluate_research_goal(plan, goal)
+        return {
+            **{key: value for key, value in goal.items() if key != "decisions"},
+            "current_evaluation": evaluation,
+            "decisions": list(goal.get("decisions", [])),
+        }
+
+    def research_plan_snapshot(self, plan_id: str) -> dict[str, Any]:
+        plan = self.research_plans[plan_id]
+        goals = [
+            self.research_goal_snapshot(plan, plan["goals"][goal_id])
+            for goal_id in plan["goal_order"]
+        ]
+        return {
+            **{key: value for key, value in plan.items() if key not in ("goals", "distribution_fingerprints")},
+            "remaining_budget": int(plan["total_budget"]) - int(plan["used_budget"]),
+            "distribution_fingerprints": dict(plan.get("distribution_fingerprints", {})),
+            "goals": goals,
+        }
+
     def inquiry_snapshot(self, inquiry_id: str) -> dict[str, Any]:
         inquiry = self.inquiries[inquiry_id]
         evaluation = self._evaluate_inquiry(inquiry)
@@ -664,6 +996,8 @@ class BranchExperiment:
             "branches": {key: _jsonable(value) for key, value in self.branches.items()},
             "inquiry_order": list(self.inquiry_order),
             "inquiries": {key: _jsonable(value) for key, value in self.inquiries.items()},
+            "research_plan_order": list(self.research_plan_order),
+            "research_plans": {key: _jsonable(value) for key, value in self.research_plans.items()},
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -729,6 +1063,9 @@ class BranchExperiment:
             "common_prefix": prefix,
             "branches": branches,
             "inquiries": [self.inquiry_snapshot(inquiry_id) for inquiry_id in self.inquiry_order],
+            "research_plans": [
+                self.research_plan_snapshot(plan_id) for plan_id in self.research_plan_order
+            ],
         }
 
     @classmethod
@@ -748,7 +1085,8 @@ class BranchExperiment:
                 "该规则上界二分方向反转，上界会坍缩到点估计（如 80/100 上界=0.8）。"
                 "原始事件、计数与当时评估保持不变；继续追加样本时改用 v2 并另行记录",
             )
-        return cls(
+        research_plans = data.get("research_plans", {})
+        experiment = cls(
             experiment_id=data["experiment_id"],
             name=data["name"],
             base_seed=int(data["base_seed"]),
@@ -760,6 +1098,9 @@ class BranchExperiment:
             inquiries=inquiries,
             inquiry_order=list(data.get("inquiry_order", inquiries.keys())),
         )
+        experiment.research_plans = research_plans
+        experiment.research_plan_order = list(data.get("research_plan_order", research_plans.keys()))
+        return experiment
 
     @classmethod
     def load(cls, path: str | Path) -> "BranchExperiment":

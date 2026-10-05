@@ -679,12 +679,23 @@ class Handler(BaseHTTPRequestHandler):
             expected_shot = ["api", "branch-experiments", None, "branches", None, "shots"]
             expected_inquiry = ["api", "branch-experiments", None, "inquiries", None, "adaptive-batch"]
             expected_inquiries = ["api", "branch-experiments", None, "inquiries"]
-            if len(parts) == len(expected_shot) and all(value is None or item == value for item, value in zip(parts, expected_shot)):
+            def matches(expected: list[str | None]) -> bool:
+                return len(parts) == len(expected) and all(
+                    value is None or item == value for item, value in zip(parts, expected)
+                )
+
+            if matches(expected_shot):
                 route = "shots"
-            elif len(parts) == len(expected_inquiry) and all(value is None or item == value for item, value in zip(parts, expected_inquiry)):
+            elif matches(expected_inquiry):
                 route = "adaptive-batch"
-            elif len(parts) == len(expected_inquiries) and all(value is None or item == value for item, value in zip(parts, expected_inquiries)):
+            elif matches(expected_inquiries):
                 route = "inquiries"
+            elif matches(["api", "branch-experiments", None, "research-plans"]):
+                route = "research-plans"
+            elif matches(["api", "branch-experiments", None, "research-plans", None, "next-batch"]):
+                route = "research-plan-batch"
+            elif matches(["api", "branch-experiments", None, "research-plans", None, "goals", None, "cancel"]):
+                route = "research-goal-cancel"
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
@@ -713,6 +724,24 @@ class Handler(BaseHTTPRequestHandler):
                     elif route == "inquiries":
                         experiment.add_inquiry(payload.get("inquiry", payload))
                         response = experiment.snapshot()
+                    elif route == "research-plans":
+                        raw_plan = payload.get("research_plan", payload)
+                        plan = experiment.create_research_plan(raw_plan)
+                        response = {"research_plan": plan, **experiment.snapshot()}
+                    elif route == "research-plan-batch":
+                        plan_id = parts[4]
+                        plan = experiment.run_research_plan_batch(plan_id)
+                        response = {"research_plan": plan, **experiment.snapshot()}
+                    elif route == "research-goal-cancel":
+                        plan_id = parts[4]
+                        goal_id = parts[6]
+                        reason = payload.get("reason")
+                        if reason is not None and (not isinstance(reason, str) or not reason.strip()):
+                            raise ValueError("reason must be a non-empty string")
+                        plan = experiment.cancel_research_goal(
+                            plan_id, goal_id, reason=reason.strip() if isinstance(reason, str) else None
+                        )
+                        response = {"research_plan": plan, **experiment.snapshot()}
                     else:
                         inquiry_id = parts[4]
                         batch_size = payload.get("batch_size")
